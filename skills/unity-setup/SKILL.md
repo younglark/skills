@@ -5,106 +5,110 @@ description: >-
   sign in (browser OAuth or service account, including 2FA), install an Editor
   version and modules, and activate or return a license.
 ---
-
 # Unity setup (Linux CLI)
 
 Install and license Unity from the terminal with the Unity CLI (no Hub GUI). Prefer this on headless or egress-limited Linux machines.
 
 Official overview: https://docs.unity.com/en-us/unity-cli/use-unity-cli
 
-**Success:** `unity --version` works, `unity auth status` is signed in, needed Editor appears in `unity editors -i`, and `unity license status` shows `active: true` with required modules present.
+**Success:** `unity --version` works, `unity auth status` is signed in, needed Editor appears in `unity editors -i`, `unity license status` shows `active: true`, and a batchmode build of a small test project succeeds.
 
 **Stop and ask before:** returning someone else's seat, removing activations in Unity ID that you did not create for this task, or using a serial/service-account secret the user did not provide for this machine.
 
 ## Prerequisites
 
 - Linux: glibc **2.34+** (Ubuntu 22.04+ / Debian 12+). Check: `ldd --version`.
-- Disk: Editor tarball is ~3GB; leave several GB free under the install home (default often `~/Unity/Hub/Editor`).
+- Disk: Editor tarball is ~3-4.5GB, unpacked install ~6.5GB; leave several GB free under the install home (default `~/Unity/Hub/Editor`).
+- Runtime deps (Debian 13 names): libgtk-3-0t64, libglu1-mesa, libnss3, libasound2t64, libxss1, libxtst6, libcap2, xvfb, ca-certificates, cpio, 7zip.
 - Network:
   - Editor downloads: `download.unity3d.com` (usually reachable).
-  - Sign-in / many license APIs: `api.unity.com` / `services.api.unity.com`.
-  - If `curl -I https://api.unity.com/` returns **403** with "Request forbidden by administrative rules", Hub/CLI OAuth and some Hub flows fail until those hosts are allowlisted—or OAuth is finished on a network that can reach them while the CLI waits for the local callback. CDN allowlist alone is not enough for auth.
+  - Sign-in / license APIs: `api.unity.com` / `services.api.unity.com`.
+  - `curl -I https://api.unity.com/` may return **403** "Request forbidden by administrative rules". Sign-in can still work: see section 2.
 
 ## 1. Install Unity CLI
 
 ```bash
 curl -fsSL https://unity.com/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"   # non-login shells may lack it
 unity --version
+unity doctor
 ```
 
-- Default binary: `~/.local/bin/unity` (ensure `~/.local/bin` is on `PATH`).
-- Update later: `unity self-update` (or package manager if installed via brew/apt).
-- Sanity: `unity doctor`.
+- Default binary: `~/.local/bin/unity`. Update later: `unity self-update`.
+- In non-TTY shells output defaults to TSV; pass `--format human` to read it.
+- List releases: `unity releases [--lts]` or `unity editors -r`. Inspect one before install: `unity editors info <ver> --format human`.
 
 ## 2. Sign in (`unity auth`)
 
-CLI **does not** accept email/password flags. Options:
+CLI **does not** accept email/password flags.
 
 ```bash
-unity auth login          # opens browser OAuth; wait for callback
+unity auth login          # prints a Sign-in URL and waits
 unity auth status
-unity auth list
 ```
 
-- Service account (CI): `unity auth login --client-id <id> --client-secret <secret>` (prefer `--secret-from-stdin`).
-- Browser flow often starts at `id.unity.com` / `login.unity.com` and may require **2FA**. Complete 2FA in the browser; keep `unity auth login` running until it exits 0.
-- If the printed Sign-in URL hits `api.unity.com` and egress blocks it, the page may 403. Workarounds: allowlist `api.unity.com` and `services.api.unity.com`, or finish OAuth on a reachable network while the CLI waits for the callback.
-- Never put passwords, OTP codes, or client secrets in chat logs; use secure forms / handoff for human 2FA.
+- On a headless box, run `unity auth login` in the background (log its output), and give the user the printed `services.api.unity.com/app-linking/...` Sign-in URL to open **on their own device**. The callback goes through Unity's app-linking channel, so this works even when the box gets 403 from `api.unity.com`. The user completes login and 2FA there; the CLI then prints "You are now signed in."
+- Service account (CI): `unity auth login --client-id <id> --secret-from-stdin`. Service-account sessions **cannot activate licenses**.
+- Never put passwords, OTP codes, or client secrets in chat logs.
 
 ## 3. Install an Editor
 
 ```bash
-unity editors -i
-unity install <VERSION> -m <module...> --accept-eula -y --non-interactive
-# example
-unity install 2021.3.44f1 --accept-eula -y --non-interactive
+unity install <VERSION> [-m <module...>] --accept-eula -y --non-interactive
+unity editors -i --format human
 ```
 
-- List module IDs for a version: `unity install <VERSION> --list-modules`.
+- Takes several minutes; run in the background. Resume with `--resume` after a timeout.
+- `unity install <VERSION> --list-modules` only works once that Editor is installed; before that use `unity editors info <ver>`.
 - Add modules later: `unity install-modules -e <VERSION> -m <id...> --accept-eula -y`.
-- Large downloads can hit **timeout** near 100%; CLI often retries. Resume with `--resume` if needed. Watch progress in command output / Hub download cache (often under `~/.config/unityhub/downloads/`).
-- Confirm: `unity editors -i` shows version and path (e.g. `~/Unity/Hub/Editor/<VERSION>/Editor/Unity`).
 
 ### Linux module notes
 
-On a **Linux** Editor install, Hub module IDs often include `linux-il2cpp` and `linux-server`, and **may not** include `linux-mono`. A missing `-m` id is skipped with a warning (`Skipping`); the Editor can still install. Linux Editor can usually build **Mono** Linux players without a separate mono module; install `linux-il2cpp` when IL2CPP Linux builds are required.
+On a **Linux** Editor, module IDs include `linux-il2cpp` and `linux-server` but **not** a Linux Mono module. Mono Linux players are built in (`Editor/Data/PlaybackEngines/LinuxStandaloneSupport/Variations/*mono*`). Install `linux-il2cpp` only for IL2CPP Linux builds. On macOS/Windows Editors, module names differ.
 
-On **macOS/Windows** Editors, Linux Build Support module names differ—always `--list-modules` for that Editor.
+`ldd` on bundled `libembree.so` / `libOpenImageDenoise` may report `libtbb` not found; those ship inside the Editor folder, so it's a false positive.
 
 ## 4. License activate / return
 
 ```bash
 unity license status
-unity license
 unity license activate --personal --accept-eula
-# or
 unity license activate --serial <SERIAL>
 unity license activate --file path/to/license.ulf
 unity license return -y
 ```
 
-- Auth and license are **separate**: signed in does not always mean a license is active. Check `unity license status` (`active: true` and a product row).
-- `--personal` may still attach an **Assigned Pro/Plus** seat if the Unity ID has one; trust `unity license status` product field, not the flag name.
-- **Activation limit**: free a seat before retrying.
-  - On a machine that holds the license: Hub → Preferences → Licenses → Return, or `unity license return -y`, or Hub sign-out for Personal.
-  - Without that machine: [Unity ID](https://id.unity.com/) → subscriptions / seats / serial activations UI → remove selected activations (labels vary by locale). Personal serial activations are often capped (e.g. 2). Leave unrelated org Pro seats alone unless the user asks.
-- After freeing seats, re-run `unity license activate ...` on the target machine.
+- Auth and license are **separate**: signed in does not mean a license is active.
+- `--personal` may attach an **Assigned Pro/Plus** seat if the Unity ID has one; trust the `unity license status` product field and tell the user which product it took.
+- **Activation limit**: return on the old machine (`unity license return -y`) or remove activations at [Unity ID](https://id.unity.com/). Leave unrelated org seats alone unless asked.
+- Batchmode logs may show `Access token is unavailable` / `No ULF license found` (code 500) even when the license works; check for `Pro License: YES` or a successful run instead.
 
-## 5. Quick verify checklist
+## 5. Verify with a batchmode build
 
-1. `unity --version` works.
-2. `unity auth status` shows signed in.
-3. `unity editors -i` lists the needed version.
-4. `unity license status` shows `active: true`.
-5. Needed platform modules present (`--list-modules` / `editors` modules column).
+```bash
+E=~/Unity/Hub/Editor/<VERSION>/Editor/Unity
+xvfb-run -a $E -batchmode -nographics -quit -createProject <TEST_PROJECT_DIR> -logFile /tmp/create.log
+xvfb-run -a $E -batchmode -nographics -quit -projectPath <TEST_PROJECT_DIR> -executeMethod BuildScript.Build -logFile /tmp/build.log
+```
+
+- Always pass `-projectPath`; without it Unity treats the current folder as a project.
+- `BuildScript.Build` (in `Assets/Editor/`): ensure a scene exists, switch to the target (e.g. StandaloneLinux64), set the scripting backend (`PlayerSettings.SetScriptingBackend(BuildTargetGroup.Standalone, ScriptingImplementation.Mono2x)`), call `BuildPipeline.BuildPlayer`, and `EditorApplication.Exit(0/1)`.
+- Look for `Build Finished, Result: Success.` Ignore ALSA/FMOD audio errors and the REST port 38000-38100 error on headless boxes.
+
+## Unity 2021.x on newer distros (Debian 13 / Ubuntu 24+)
+
+1. **Script compilation hangs** at `bee_backend ... --stdin-canary` with 0% CPU. Fix: rename `Editor/Data/bee_backend` to `bee_backend_real` and replace it with a wrapper script that drops `--stdin-canary` and execs `bee_backend_real "$@"`. Redo after reinstalling the Editor; undo with `mv bee_backend_real bee_backend`.
+2. **`No usable version of libssl was found` / exit 134** during compilation: the bundled .NET 5 needs OpenSSL 1.1. Install Debian 11's `libssl1.1` package (from deb.debian.org) alongside libssl3. It is end-of-life; mention that to the user.
 
 ## Common failures
 
 | Symptom | Likely cause | What to try |
 | --- | --- | --- |
-| `api.unity.com` 403 administrative rules | Egress proxy | Allowlist Unity API hosts; do not assume download CDN allowlist is enough |
-| `AUTH_LOGIN_FAILED` / login timeout | OAuth or 2FA not finished | Keep browser flow open; complete 2FA; check CLI still waiting |
-| `Missing module "…" Skipping` | Wrong module id for this OS Editor | `unity install <ver> --list-modules` |
-| Download 100% then timeout / retry | Transient / slow validate | Wait for retries; `--resume`; check disk space |
+| `api.unity.com` 403 administrative rules | Egress proxy | Finish the app-linking sign-in URL on the user's device; allowlist for other API needs |
+| `AUTH_LOGIN_FAILED` / login timeout | OAuth or 2FA not finished | Keep `unity auth login` running; user completes it in browser |
+| `Missing module "…" Skipping` | Wrong module id for this OS Editor | `unity editors info <ver>` |
+| Download timeout near 100% | Transient | Wait for retries; `--resume`; check disk |
+| `No valid Unity Editor license found` | Never activated | `unity license activate --personal --accept-eula` |
 | Activation limit | Seats full | Return on old machine or remove activations in Unity ID |
-| License none active after login | Never activated | `unity license activate --personal --accept-eula` or serial/file |
+| Hang at `bee_backend --stdin-canary` | Unity 2021 Linux bug | bee_backend wrapper (above) |
+| `No usable version of libssl` | OpenSSL 3 only | Install libssl1.1 |
