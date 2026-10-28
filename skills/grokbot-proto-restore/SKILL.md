@@ -1,6 +1,6 @@
 ---
 name: grokbot-proto-restore
-description: 在需要从 Grok Bot.app（macOS，Electron/Anysphere sand 内核）还原出完整可用的 .proto 文件时使用：解包 app.asar 取出 proto.cjs，把 @bufbuild/protobuf 紧凑描述符还原成真正可编译的 .proto，用版本对齐的 protoc-gen-es / protoc-gen-connect-es 生成强类型客户端，并用描述符级 + wire 级双重对拍证明结果与 app 内 proto.cjs 完全一致。也用于 Grok Bot 版本更新后重新还原协议、对比两版新增/删除/变更了哪些 RPC 与消息。关键词：Grok Bot 升级、还原 proto、proto.cjs、protobuf-es、asar 解包、RPC 变化、GrokBotService；English triggers: restore Grok Bot proto, proto.cjs descriptor, protobuf-es codegen, Grok Bot RPC diff.
+description: "在需要从 Grok Bot.app（macOS，Electron/Anysphere sand 内核）还原出完整可用的 .proto 文件时使用：解包 app.asar 取出 proto.cjs，把 @bufbuild/protobuf 紧凑描述符还原成真正可编译的 .proto，用版本对齐的 protoc-gen-es / protoc-gen-connect-es 生成强类型客户端，并用描述符级 + wire 级双重对拍证明结果与 app 内 proto.cjs 完全一致。也用于 Grok Bot 版本更新后重新还原协议、对比两版新增/删除/变更了哪些 RPC 与消息。关键词：Grok Bot 升级、还原 proto、proto.cjs、protobuf-es、asar 解包、RPC 变化、GrokBotService；English triggers: restore Grok Bot proto, proto.cjs descriptor, protobuf-es codegen, Grok Bot RPC diff."
 ---
 
 # Grok Bot proto 还原
