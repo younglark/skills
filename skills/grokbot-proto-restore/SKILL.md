@@ -25,7 +25,7 @@ app 逐字段、逐字节一致 —— 而不是"看起来对"。
 ## 前置依赖
 
 ```bash
-pip install grpcio-tools     # 提供可用的 protoc；本机 homebrew 的 protoc 是坏的
+pip install grpcio-tools     # 提供可用的 protoc（python3 -m grpc_tools.protoc）
 node >= 18                   # npx @electron/asar 解包用
 ```
 
