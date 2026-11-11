@@ -114,7 +114,7 @@ open -a "Adobe Photoshop 2026" /path/to/run_job.psjs
 ```bash
 log=~/ps-job/job_log.json; rm -f "$log"
 open -a "Adobe Photoshop 2026" ~/ps-job/run_job.psjs
-for i in {1..300}; do [ -f "$log" ] && grep -q '"done":true' "$log" && break; sleep 2; done
+for i in {1..300}; do [ -f "$log" ] && grep -Eq '"done": ?true' "$log" && break; sleep 2; done
 cat "$log"
 ```
 
