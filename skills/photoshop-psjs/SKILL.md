@@ -10,9 +10,9 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 - **官方**：来自 Adobe UXP 文档，文末有链接。
 - **实测**：在 Windows、Adobe Photoshop 2026 上用 `.psjs` 跑通的经验。未核实的标为 **未核实**，不要当成官方 API。
 
-**成功标准：** 脚本写完结果 JSON（含 `done` / `ok` / `fatal` / `errs`），只关闭自己创建的文档，用户已打开的未保存文档未被改动；需要像素对齐时，导出 PNG 并与金图做 ΔE / 像素差后迭代。
+**成功标准：** 脚本写完结果 JSON（含 `done` / `ok` / `fatal` / `errs`）；只改动任务指定的目标文档，其他打开的文档不受影响；需要像素对齐时，导出 PNG 并与金图做 ΔE / 像素差后迭代。
 
-**先停下来：** 目标机上的 Photoshop 正在编辑用户未保存的文档，且任务可能打开、保存或关闭「当前文档」而不是脚本自己创建的文档。
+**先停下来：** 任务没说清要改哪个文档，或者要覆盖保存一个有用户未保存改动的文档，而任务没明确允许。
 
 ---
 
@@ -125,13 +125,26 @@ await out.write(JSON.stringify(log, null, 2));
 
 ---
 
-## 5. 文档安全（必须）
+## 5. 文档范围与安全（必须）
 
-- **禁止**改、存、关用户已打开且未保存的文档。
-- 跑脚本前记下 `app.documents.map(d => ({name: d.name, id: d.id}))`，结束后再记一次，写进日志。
-- 只把**本脚本创建或本脚本打开**的文档 id 放进 `ours`；所有 `batchPlay`、保存、关闭之前检查 `app.activeDocument.id` 是否在集合里。这个守卫只对「隐式指向当前文档」的描述符有效；如果描述符里显式写了 `{ _ref: "document", _id }`，那个 id 也要过守卫。
-- 切片时用「当前图层新建文档」会多出一个文档：新文档 id 也要加入 `ours`，用完 `closeWithoutSaving()`，再把 `app.activeDocument` 切回主文档。失败时同样只关 `ours` 里的文档。
-- 官方：`executionContext.hostControl.registerAutoCloseDocument(docID)` 可在用户取消或 modal 结束时自动关闭临时文档；成功保存并打算留给美术继续改时，先 `unregisterAutoCloseDocument`。
+原则：**脚本只碰任务指定的目标文档**。目标可以是脚本新建的文档，也可以是任务点名的已有 PSD（迭代现有设计稿是常见场景）。其余打开的文档一律不改、不存、不关。
+
+**确定目标集合 `targets`：**
+
+- 新建：`app.createDocument()` 返回的 id 加入 `targets`。
+- 迭代已有 PSD：按任务给的**路径**定位。先在 `app.documents` 里按 `doc.path` 找是否已打开；已打开就直接用这个实例（不要再开第二份），没打开就 `app.open(entry)`。只按名字匹配不可靠（重名、「-恢复的」副本），优先路径，其次任务给的 doc id。
+- 临时文档（如「从图层新建」切片）加入 `targets`，用完 `closeWithoutSaving()`。
+
+**守卫：** 所有 `batchPlay`、保存、关闭之前检查 `app.activeDocument.id` 是否在 `targets` 里。这个检查只管「隐式指向当前文档」的描述符；描述符里显式写了 `{ _ref: "document", _id }` 时，那个 id 也要检查。跑前跑后各记一次 `app.documents.map(d => ({ name: d.name, id: d.id, path: d.path }))` 写进日志。
+
+**改已有文档时：**
+
+- 目标文档已打开且有未保存改动（官方 `doc.saved === false`），说明用户正在手动改。默认可以在其上继续编辑（这正是迭代任务），但**不要覆盖保存**，除非任务明确要求；先在日志里写明它运行前就是 dirty 状态。
+- 用 `hostControl.suspendHistory` 把本次脚本的修改合成一步历史记录，用户一次 Ctrl+Z 就能撤回。
+- 保存策略按任务定：默认另存新版本（如 `xxx_v14.psd`），保留原文件；任务明确要求「原地更新」时再 `doc.save()`。
+- 脚本结束时不要关闭用户原本就打开的目标文档；只关脚本自己打开或新建、且任务不要求保留的文档。
+
+**自动清理：** 官方 `executionContext.hostControl.registerAutoCloseDocument(docID)` 可在用户取消或 modal 结束时自动关闭临时文档，只用于脚本新建的文档；要留给美术继续改时，先 `unregisterAutoCloseDocument`。**不要**对用户已有的文档注册自动关闭。
 
 ---
 
