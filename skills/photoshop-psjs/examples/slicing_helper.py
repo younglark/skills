@@ -1195,6 +1195,94 @@ def public_crop_name(layer_id):
     return f"{int(layer_id)}.png"
 
 
+def node_effect_names(node):
+    return [e for e in (node.get("effects") or []) if e]
+
+
+def is_effect_group(node) -> bool:
+    """A folder/group (not an artboard) that carries its own layer effects."""
+    return bool(
+        node
+        and node.get("is_group")
+        and not node.get("is_artboard")
+        and node.get("layer_id") is not None
+        and node_effect_names(node)
+    )
+
+
+def nearest_effect_group(ancestors):
+    """Nearest ancestor group that has layer effects. Artboards are skipped."""
+    for anc in reversed(ancestors or []):
+        if is_effect_group(anc):
+            return anc
+    return None
+
+
+def iter_effect_groups(node, artboard_bbox=None, ancestors=None):
+    """Yield (group, ancestors) for groups with layer effects under node."""
+    ancestors = list(ancestors or [])
+    if is_effect_group(node):
+        if artboard_bbox is None or bbox_intersects(node.get("bbox"), artboard_bbox):
+            yield node, ancestors
+    for child in all_children(node):
+        yield from iter_effect_groups(child, artboard_bbox, ancestors + [node])
+
+
+def collect_descendant_leaf_ids(node):
+    """Layer ids of descendant leaves under node (not the node itself)."""
+    ids = []
+    for child in all_children(node):
+        grand = all_children(child)
+        if grand:
+            ids.extend(collect_descendant_leaf_ids(child))
+        elif child.get("layer_id") is not None and not child.get("is_adjustment"):
+            ids.append(child["layer_id"])
+    return ids
+
+
+def leaf_to_effect_group_map(root, artboard_bbox=None):
+    """Map each leaf layer_id to the nearest ancestor group that has effects."""
+    mapping = {}
+
+    def walk(node, ancestors):
+        kids = all_children(node)
+        if not kids and node.get("layer_id") is not None and not node.get("is_group"):
+            group = nearest_effect_group(ancestors)
+            if group is not None:
+                mapping[node["layer_id"]] = group
+        for child in kids:
+            walk(child, ancestors + [node])
+
+    walk(root, [])
+    return mapping
+
+
+def effect_group_record(group, crop_rel=None, size=None):
+    lid = group["layer_id"]
+    return {
+        "layer_id": lid,
+        "name": group.get("name") or "",
+        "path": group.get("path") or "",
+        "kind": group.get("kind") or "group",
+        "is_group": True,
+        "is_text": False,
+        "effects": node_effect_names(group),
+        "visible": bool(group.get("visible")),
+        "bbox": group.get("bbox"),
+        "child_leaf_ids": collect_descendant_leaf_ids(group),
+        "select_ids": [lid],
+        "suggested_select_ids": [lid],
+        "crop": crop_rel,
+        "size": size,
+        "notes": (
+            "Layer effects such as DropShadow live on this group, not on the inner leaf. "
+            "Export the group: set layer_id and select_ids to this group id. "
+            "A missing crop for this id is not a reason to fall back to a child. "
+            "Visible bounds must include the baked effects; do not clip to the child's logical bounds."
+        ),
+    }
+
+
 def write_crop_sheet(items, out_path, thumb=160, cols=8):
     """Contact sheet of crops with id / visibility labels (agent overview)."""
     if not items:
@@ -1222,6 +1310,9 @@ def write_crop_sheet(items, out_path, thumb=160, cols=8):
             except Exception:
                 draw.rectangle([x, y, x + thumb, y + thumb], fill=(60, 40, 40))
         flag = "HID" if not item.get("visible") else "vis"
+        extra = item.get("flag")
+        if extra:
+            flag = f"{flag}/{extra}"
         label = f"{item.get('layer_id')} {flag}"
         draw.text((x, y + thumb + 2), label, fill=(255, 220, 80) if flag == "HID" else (200, 200, 200), font=font_sm)
         name = (item.get("name") or "")[:18]
@@ -1352,7 +1443,66 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
                 "nine_slice": nine,
                 "crop": rec["crop"],
             })
-    print(f"wrote {len(crop_records)} crops in {time.time()-t4:.1f}s", flush=True)
+
+    # Annotate leaves whose nearest parent group carries the effects (e.g. DropShadow).
+    leaf_groups = leaf_to_effect_group_map(target, bbox)
+    for rec in crop_records:
+        group = leaf_groups.get(rec["layer_id"])
+        if not group:
+            continue
+        rec["parent_group_id"] = group["layer_id"]
+        rec["parent_effects"] = node_effect_names(group)
+        rec["suggested_select_ids"] = [group["layer_id"]]
+        notes = rec.get("notes") or []
+        if isinstance(notes, str):
+            notes = [notes]
+        notes.append(
+            "Nearest parent group has layer effects; export that group id "
+            "(see suggested_select_ids), not only this leaf."
+        )
+        rec["notes"] = notes
+
+    group_effect_records = []
+    existing_ids = {r["layer_id"] for r in crop_records}
+    t_g = time.time()
+    for group, _anc in iter_effect_groups(target, bbox):
+        lid = group.get("layer_id")
+        if lid is None or lid in existing_ids:
+            continue
+        image = None
+        try:
+            image = try_composite(group, warnings, force=True)
+        except Exception as exc:
+            warnings.append(f"group composite failed {group.get('path')}: {exc}")
+            image = None
+        crop_rel = None
+        size = None
+        if image is not None and image.size[0] > 0 and image.size[1] > 0:
+            arr = __import__("numpy").asarray(image)
+            if arr.size and int(arr[..., 3].max()) > 0:
+                out_png = crops_dir / public_crop_name(lid)
+                image.save(out_png, "PNG")
+                crop_rel = f"crops/{public_crop_name(lid)}"
+                size = list(image.size)
+        rec = effect_group_record(group, crop_rel=crop_rel, size=size)
+        rec["nine_slice"] = None
+        crop_records.append(rec)
+        existing_ids.add(lid)
+        group_effect_records.append(rec)
+    print(
+        f"wrote {len(crop_records)} crop-index entries "
+        f"({len(group_effect_records)} effect groups) in {time.time()-t4:.1f}s "
+        f"(groups {time.time()-t_g:.1f}s)",
+        flush=True,
+    )
+    (dest / "group_effects.json").write_text(
+        json.dumps(
+            {"count": len(group_effect_records), "groups": group_effect_records},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     (dest / "crops_index.json").write_text(
         json.dumps({"count": len(crop_records), "crops": crop_records}, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1363,12 +1513,16 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
     )
     sheet_items = []
     for rec in crop_records:
-        sheet_items.append({
+        crop_name = rec.get("crop")
+        item = {
             "layer_id": rec["layer_id"],
             "name": rec["name"],
             "visible": rec["visible"],
-            "path": dest / rec["crop"],
-        })
+            "path": (dest / crop_name) if crop_name else None,
+        }
+        if rec.get("is_group"):
+            item["flag"] = "FX"
+        sheet_items.append(item)
     sheet_path = dest / "crops_sheet.jpg"
     write_crop_sheet(sheet_items, sheet_path)
     hidden_n = sum(1 for r in crop_records if not r["visible"])
@@ -1381,19 +1535,25 @@ def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
         "crops_index": str(dest / "crops_index.json"),
         "crops_sheet": str(sheet_path),
         "nine_slice_candidates": str(dest / "nine_slice_candidates.json"),
+        "group_effects": str(dest / "group_effects.json"),
         "stats": {
             "crop_count": len(crop_records),
             "hidden_crops": hidden_n,
             "text_crops": text_n,
+            "effect_groups": len(group_effect_records),
             "nine_slice_candidates": len(nine_candidates),
             "visible_nodes": sum(1 for r in crop_records if r["visible"]),
             "prepare_sec": round(time.time() - time_base, 2),
         },
         "notes": [
             "Look at full_render_preview.png (visible/default state; psd-tools may omit some layer effects),",
-            "the crops (filename is layer_id), crops_sheet.jpg, and tree.json together.",
+            "the crops (filename is layer_id), crops_sheet.jpg, group_effects.json, and tree.json together.",
             "Then write manifest.json with components / parts / states. Hidden crops are candidates for alternate states.",
             "Do not copy raw PSD layer names. Naming is 模块_类型_用途_状态, lowercase.",
+            "If a parent group has layer effects and the inner leaf does not, export the group "
+            "(suggested_select_ids / group_effects.json). A missing crop for a group id is not "
+            "a reason to fall back to the child. Visible bounds must include baked effects.",
+            "psd-tools thumbnails may omit those baked effects; Photoshop export of the group bakes them.",
         ],
     }
     (dest / "materials.json").write_text(json.dumps(materials, ensure_ascii=False, indent=2), encoding="utf-8")
