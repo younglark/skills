@@ -1,0 +1,163 @@
+{
+  "default_module": "main",
+  "chrome_module": "common",
+  "module_keywords": [
+    [
+      "popup",
+      "popup"
+    ],
+    [
+      "dialog",
+      "popup"
+    ]
+  ],
+  "type_keywords": [
+    [
+      "button",
+      "btn"
+    ],
+    [
+      "btn",
+      "btn"
+    ],
+    [
+      "tab",
+      "tab"
+    ],
+    [
+      "icon",
+      "icon"
+    ],
+    [
+      "frame",
+      "frame"
+    ],
+    [
+      "background",
+      "bg"
+    ],
+    [
+      "panel",
+      "bg"
+    ],
+    [
+      "bg",
+      "bg"
+    ],
+    [
+      "deco",
+      "deco"
+    ],
+    [
+      "mask",
+      "mask"
+    ],
+    [
+      "item",
+      "item"
+    ]
+  ],
+  "purpose_keywords": [
+    [
+      "navbar",
+      "navbar"
+    ],
+    [
+      "topbar",
+      "topbar"
+    ],
+    [
+      "timer",
+      "timer"
+    ],
+    [
+      "title",
+      "title"
+    ],
+    [
+      "avatar",
+      "avatar"
+    ],
+    [
+      "screen",
+      "screen"
+    ],
+    [
+      "list",
+      "list"
+    ]
+  ],
+  "state_keywords": [
+    [
+      "_off",
+      "off"
+    ],
+    [
+      "_on",
+      "on"
+    ],
+    [
+      "disabled",
+      "disabled"
+    ],
+    [
+      "pressed",
+      "pressed"
+    ],
+    [
+      "hover",
+      "hover"
+    ],
+    [
+      "normal",
+      "normal"
+    ]
+  ],
+  "skip_tokens": [
+    "copy",
+    "group",
+    "layer"
+  ],
+  "special_layer_names": {
+    "bg": [
+      "bg",
+      "screen",
+      ""
+    ]
+  },
+  "fixed_labels": [
+    "ok",
+    "cancel",
+    "start"
+  ],
+  "chrome_path_keywords": [
+    "navbar",
+    "topbar",
+    "header",
+    "footer"
+  ],
+  "role_path_groups": {
+    "tab_label": [
+      "tab",
+      "segment"
+    ],
+    "nav_label": [
+      "navbar",
+      "footer"
+    ],
+    "title_label": [
+      "topbar",
+      "header"
+    ]
+  },
+  "list_item_pattern": "/list\\s*(\\d+)(?:/|$)",
+  "self_row_keywords": [
+    "self"
+  ],
+  "art_text_name_keywords": [
+    "title"
+  ],
+  "value_name_keywords": [
+    "player name"
+  ]
+}

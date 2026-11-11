@@ -1,0 +1,9 @@
+{
+  "root_url": "file:/D:/work/ps-job",
+  "source_url": "file:/D:/work/ps-job/design.psb",
+  "source_path_hint": "D:\\work\\ps-job\\design.psb",
+  "manifest_name": "manifest.json",
+  "log_name": "export_log.json",
+  "slices_dir_name": "slices",
+  "full_render_name": "full_render.png"
+}

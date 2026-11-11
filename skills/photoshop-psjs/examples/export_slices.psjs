@@ -3,22 +3,35 @@
 // Reads a confirmed manifest JSON, exports 1x PNGs by layer_id (effects baked in),
 // records visible / logical bounds and text attributes, and writes a full artboard render.
 //
-// Configure the constants below. Do not pass extra CLI arguments (the script will not run).
+// Point CONFIG_URL at the job config JSON (must already exist). Do not pass CLI arguments
+// (the script will not run). See export_config.example.json.
 // Use dialogOptions "silent" on every descriptor; "dontDisplay" still pops error dialogs.
 // Top-level await is required. Only documents in the target set are edited or closed.
 
 const { app, core, action } = require("photoshop");
 const fs = require("uxp").storage.localFileSystem;
 
-// --- configure these paths for the job directory (must already exist) ---
-const ROOT_URL = "file:/D:/work/ps-job";
-const SOURCE_URL = "file:/D:/work/ps-job/design.psb";
-const SOURCE_PATH_HINT = "D:\\work\\ps-job\\design.psb"; // matched against doc.path
-const MANIFEST_NAME = "manifest.json";
-const LOG_NAME = "export_log.json";
-const SLICES_DIR_NAME = "slices";
-const FULL_RENDER_NAME = "full_render.png";
+// --- the only path the script itself hardcodes; edit this for the job ---
+const CONFIG_URL = "file:/D:/work/ps-job/export_config.json";
 // -----------------------------------------------------------------------
+
+let ROOT_URL, SOURCE_URL, SOURCE_PATH_HINT, MANIFEST_NAME, LOG_NAME, SLICES_DIR_NAME, FULL_RENDER_NAME;
+
+async function loadConfig() {
+  const entry = await fs.getEntryWithUrl(CONFIG_URL);
+  const cfg = JSON.parse(await entry.read());
+  if (!cfg || !cfg.root_url || !cfg.source_url) {
+    throw new Error("export config must include root_url and source_url");
+  }
+  ROOT_URL = cfg.root_url;
+  SOURCE_URL = cfg.source_url;
+  SOURCE_PATH_HINT = cfg.source_path_hint || "";
+  MANIFEST_NAME = cfg.manifest_name || "manifest.json";
+  LOG_NAME = cfg.log_name || "export_log.json";
+  SLICES_DIR_NAME = cfg.slices_dir_name || "slices";
+  FULL_RENDER_NAME = cfg.full_render_name || "full_render.png";
+}
+
 
 const log = {
   started: new Date().toISOString(),
@@ -212,6 +225,7 @@ async function closeTemp(doc) {
 }
 
 try {
+  await loadConfig();
   rootDir = await fs.getEntryWithUrl(ROOT_URL);
   try {
     slicesDir = await rootDir.getEntry(SLICES_DIR_NAME);
@@ -418,26 +432,34 @@ try {
       const tFull = nowMs();
       try {
         app.activeDocument = src;
-        if (!artboard || !artboard.id) throw new Error("manifest.source.artboard.id is required");
-        await bp([{
-          _obj: "select",
-          _target: [{ _ref: "layer", _id: artboard.id }],
-          makeVisible: false
-        }]);
-        await bp([{
-          _obj: "make",
-          _target: [{ _ref: "document" }],
-          name: "full_render",
-          using: { _ref: "layer", _enum: "ordinal", _value: "targetEnum" },
-          version: 5
-        }]);
+        const hasArtboardId = artboard && artboard.id != null;
+        if (hasArtboardId) {
+          await bp([{
+            _obj: "select",
+            _target: [{ _ref: "layer", _id: artboard.id }],
+            makeVisible: false
+          }]);
+          await bp([{
+            _obj: "make",
+            _target: [{ _ref: "document" }],
+            name: "full_render",
+            using: { _ref: "layer", _enum: "ordinal", _value: "targetEnum" },
+            version: 5
+          }]);
+        } else {
+          await bp([{
+            _obj: "duplicate",
+            _target: [{ _ref: "document", _id: src.id }],
+            name: "full_render"
+          }]);
+        }
         const tmp = app.activeDocument;
         ours.add(tmp.id);
         try { await executionContext.hostControl.registerAutoCloseDocument(tmp.id); } catch (err) {}
         for (const layer of tmp.layers) layer.visible = true;
-        const wantW = artboard.size && artboard.size[0];
-        const wantH = artboard.size && artboard.size[1];
-        const abBounds = artboard.bounds; // document coords [l,t,r,b]
+        const wantW = artboard && artboard.size && artboard.size[0];
+        const wantH = artboard && artboard.size && artboard.size[1];
+        const abBounds = artboard && artboard.bounds; // document coords [l,t,r,b]
         fullItem.before_size = [tmp.width, tmp.height];
         // If the new doc is still the full canvas, crop to the artboard's document box
         // (not 0,0,w,h — that would take the top-left artboard instead).

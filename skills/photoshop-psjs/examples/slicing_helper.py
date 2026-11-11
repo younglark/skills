@@ -6,6 +6,7 @@ Requires: psd-tools, Pillow, numpy
 
 Subcommands:
   infer       Read a PSD/PSB with psd-tools and write manifest JSON + annotated preview.
+              Optional --artboard <name or id>; optional --rules naming JSON.
   preview     Redraw the annotated preview from a (possibly edited) manifest.
   build-layout  Merge confirmed manifest + Photoshop export log + PNGs into layout JSON.
   validate    Recomposite slices from layout metadata and compare with a full PS render.
@@ -38,89 +39,6 @@ except ImportError:
 
 SCHEMA_MANIFEST = "psjs-slice-manifest/v1"
 SCHEMA_LAYOUT = "psjs-layout/v1"
-
-# ---------------------------------------------------------------------------
-# Naming dictionaries (Chinese / English tokens -> slug parts)
-# ---------------------------------------------------------------------------
-
-MODULE_TOKENS = {
-    "排行榜": "rank", "总榜": "rank", "日榜": "rank", "排行": "rank",
-    "ranking": "rank", "rank": "rank",
-    "商店": "shop", "shop": "shop",
-    "弹窗": "popup", "popup": "popup",
-    "公共": "common", "common": "common",
-    "底部ui": "common", "顶部ui": "common", "底部": "common", "顶部": "common",
-}
-
-TYPE_TOKENS = [
-    ("smartobject", None),  # not a type by itself
-    ("边框", "frame"), ("frame", "frame"), ("头像框", "frame"),
-    ("按钮", "btn"), ("btn", "btn"), ("选项", "btn"),
-    ("页签", "tab"), ("tab", "tab"),
-    ("图标", "icon"), ("icon", "icon"), ("徽章", "icon"), ("奖牌", "icon"),
-    ("皇冠", "icon"), ("头像", "icon"), ("锁头", "icon"), ("秒表", "icon"),
-    ("背景", "bg"), ("底衬", "bg"), ("底板", "bg"), ("衬底", "bg"),
-    ("面板", "bg"), ("panel", "bg"),
-    ("装饰", "deco"), ("光效", "deco"), ("halftone", "deco"),
-    ("横线", "deco"), ("竖线", "deco"),
-    ("mask", "mask"), ("蒙版", "mask"),
-    ("列表项", "item"), ("item", "item"),
-    ("img", "img"), ("图片", "img"),
-]
-
-PURPOSE_TOKENS = [
-    ("navtab", "navtab"), ("navbar", "navbar"), ("bottom", "navbar"),
-    ("topbar", "topbar"), ("顶部ui", "topbar"), ("底部ui", "navbar"),
-    ("倒计时", "timer"), ("秒表", "timer"), ("timer", "timer"),
-    ("标题", "title"), ("title", "title"),
-    ("领奖台", "podium"), ("podium", "podium"),
-    ("头像", "avatar"), ("avatar", "avatar"),
-    ("奖牌", "medal"), ("徽章", "medal"), ("medal", "medal"),
-    ("皇冠", "crown"), ("crown", "crown"),
-    ("锁", "lock"), ("lock", "lock"),
-    ("金币", "coin"), ("coin", "coin"),
-    ("星星", "star"), ("五星", "star"), ("star", "star"),
-    ("失败", "fail"), ("fail", "fail"),
-    ("主页", "home"), ("home", "home"),
-    ("商店", "shop"), ("shop", "shop"),
-    ("排行", "rank"), ("ranking", "rank"),
-    ("日榜", "daily"), ("daily", "daily"),
-    ("总榜", "total"), ("total", "total"),
-    ("名字", "name"), ("分数", "score"), ("排名", "place"),
-    ("槽", "slot"), ("slot", "slot"),
-    ("屏幕", "screen"), ("screen", "screen"),
-    ("列表", "list"), ("list", "list"),
-    ("横线", "hline"), ("竖线", "vline"), ("分割", "divider"),
-    ("底", "base"),
-]
-
-STATE_TOKENS = [
-    ("未选中", "off"), ("选中", "on"), ("_off", "off"), ("_on", "on"),
-    ("off", "off"), ("on", "on"),
-    ("自己", "self"), ("myself", "self"), ("self", "self"),
-    ("普通", "normal"), ("normal", "normal"),
-    ("金色", "gold"), ("黄金", "gold"), ("gold", "gold"),
-    ("银色", "silver"), ("silver", "silver"),
-    ("铜色", "bronze"), ("bronze", "bronze"),
-    ("空", "empty"), ("empty", "empty"),
-    ("满", "full"), ("full", "full"),
-    ("按下", "pressed"), ("pressed", "pressed"),
-    ("禁用", "disabled"), ("disabled", "disabled"),
-    ("hover", "hover"),
-]
-
-SKIP_TOKENS = {"拷贝", "copy", "组", "图层", "形状", "矩形", "group", "layer"}
-
-SPECIAL_LAYER_NAMES = {
-    "no.1": ("icon", "medal", "gold"),
-    "no.2": ("icon", "medal", "silver"),
-    "no.3": ("icon", "medal", "bronze"),
-    "bg": ("bg", "screen", ""),
-    "bottom": ("bg", "navbar", ""),
-    "panel_list": ("bg", "item", "normal"),
-    "ui顶部bg": ("bg", "topbar", ""),
-    "当前选项bg": ("bg", "navtab", "on"),
-}
 
 KIND_COLORS = {
     "image": (0, 170, 255),
@@ -268,11 +186,169 @@ def descendant_visible_ids(node):
     return ids
 
 
-def looks_like_state_name(name: str) -> bool:
+# ---------------------------------------------------------------------------
+# Naming rules (optional --rules JSON; generic defaults otherwise)
+# ---------------------------------------------------------------------------
+
+DEFAULT_RULES = {
+    "default_module": "main",
+    "chrome_module": "common",
+    "module_keywords": [],
+    "type_keywords": [
+        ["button", "btn"], ["btn", "btn"],
+        ["tab", "tab"],
+        ["icon", "icon"],
+        ["frame", "frame"],
+        ["background", "bg"], ["panel", "bg"], ["bg", "bg"],
+        ["deco", "deco"],
+        ["mask", "mask"],
+        ["item", "item"],
+        ["img", "img"],
+    ],
+    "purpose_keywords": [
+        ["navbar", "navbar"], ["topbar", "topbar"],
+        ["timer", "timer"], ["title", "title"],
+        ["avatar", "avatar"],
+        ["screen", "screen"], ["list", "list"],
+        ["slot", "slot"], ["divider", "divider"],
+    ],
+    "state_keywords": [
+        ["_off", "off"], ["_on", "on"],
+        ["off", "off"], ["on", "on"],
+        ["normal", "normal"],
+        ["empty", "empty"], ["full", "full"],
+        ["pressed", "pressed"], ["disabled", "disabled"],
+        ["hover", "hover"], ["selected", "on"],
+    ],
+    "skip_tokens": ["copy", "group", "layer"],
+    "special_layer_names": {},
+    "fixed_labels": [],
+    "chrome_path_keywords": ["navbar", "topbar", "header", "footer"],
+    "role_path_groups": {
+        "tab_label": ["tab", "segment"],
+        "nav_label": ["navbar", "footer"],
+        "title_label": ["topbar", "header"],
+    },
+    "list_item_pattern": r"/list\s*(\d+)(?:/|$)",
+    "self_row_keywords": ["self"],
+    "art_text_name_keywords": ["title"],
+    "value_name_keywords": ["player name"],
+}
+
+
+def _pairs(seq):
+    out = []
+    if isinstance(seq, dict):
+        seq = seq.items()
+    for item in seq or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            out.append((str(item[0]), str(item[1])))
+    return out
+
+
+def merge_rules(base, overlay):
+    out = json.loads(json.dumps(base))
+    for key, val in (overlay or {}).items():
+        if val is None:
+            continue
+        if key in {"module_keywords", "type_keywords", "purpose_keywords", "state_keywords"}:
+            seen = set()
+            merged = []
+            for pair in _pairs(val) + _pairs(out.get(key)):
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                merged.append(list(pair))
+            out[key] = merged
+        elif key in {
+            "skip_tokens", "fixed_labels", "chrome_path_keywords",
+            "self_row_keywords", "art_text_name_keywords", "value_name_keywords",
+        }:
+            seen = set()
+            merged = []
+            for item in list(val) + list(out.get(key) or []):
+                mark = str(item).casefold()
+                if mark in seen:
+                    continue
+                seen.add(mark)
+                merged.append(item)
+            out[key] = merged
+        elif key == "special_layer_names":
+            merged = dict(out.get(key) or {})
+            merged.update(val)
+            out[key] = merged
+        elif key == "path_specials":
+            out[key] = list(val) + list(out.get(key) or [])
+        elif key == "role_path_groups":
+            merged = dict(out.get(key) or {})
+            for role, paths in (val or {}).items():
+                old = [str(p) for p in (merged.get(role) or [])]
+                new = [str(p) for p in (paths or [])]
+                merged[role] = new + [p for p in old if p not in new]
+            out[key] = merged
+        else:
+            out[key] = val
+    return out
+
+
+class NamingRules:
+    def __init__(self, data):
+        d = data or {}
+        self.module_keywords = _pairs(d.get("module_keywords"))
+        self.type_keywords = _pairs(d.get("type_keywords"))
+        self.purpose_keywords = _pairs(d.get("purpose_keywords"))
+        self.state_keywords = _pairs(d.get("state_keywords"))
+        self.skip_tokens = {str(x).lower() for x in (d.get("skip_tokens") or [])}
+        special = d.get("special_layer_names") or {}
+        self.special_layer_names = {}
+        for key, val in special.items():
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                state = val[2] if len(val) > 2 else ""
+                self.special_layer_names[str(key).strip().lower()] = (
+                    val[0] or "", val[1] or "", state or "",
+                )
+        self.fixed_labels = {str(x).casefold() for x in (d.get("fixed_labels") or [])}
+        self.chrome_path_keywords = [str(x).lower() for x in (d.get("chrome_path_keywords") or [])]
+        self.chrome_module = d.get("chrome_module") or "common"
+        groups = d.get("role_path_groups") or {}
+        self.role_path_groups = {
+            str(role): [str(p).lower() for p in (paths or [])]
+            for role, paths in groups.items()
+        }
+        self.list_item_pattern = d.get("list_item_pattern") or r"/list\s*(\d+)(?:/|$)"
+        self.self_row_keywords = [str(x).lower() for x in (d.get("self_row_keywords") or [])]
+        self.art_text_name_keywords = [str(x).lower() for x in (d.get("art_text_name_keywords") or [])]
+        self.default_module = d.get("default_module") or "main"
+        self.value_name_keywords = [str(x).lower() for x in (d.get("value_name_keywords") or [])]
+        self.path_specials = []
+        for item in d.get("path_specials") or []:
+            parts = item.get("parts") or [item.get("type"), item.get("purpose"), item.get("state")]
+            self.path_specials.append({
+                "path_includes": [str(x).lower() for x in (item.get("path_includes") or [])],
+                "name": str(item.get("name") or "").strip().lower(),
+                "name_prefix": str(item.get("name_prefix") or "").strip().lower(),
+                "type": (parts[0] if len(parts) > 0 else "") or "",
+                "purpose": (parts[1] if len(parts) > 1 else "") or "",
+                "state": (parts[2] if len(parts) > 2 else "") or "",
+            })
+
+    @classmethod
+    def load(cls, path=None):
+        data = json.loads(json.dumps(DEFAULT_RULES))
+        if path:
+            overlay = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(overlay, dict):
+                raise SystemExit(f"rules file must be a JSON object: {path}")
+            data = merge_rules(data, overlay)
+        return cls(data)
+
+
+def looks_like_state_name(name: str, rules: NamingRules | None = None) -> bool:
     low = (name or "").lower()
-    return bool(re.search(r"(_on|_off|选中|未选中|myself|self|自己)$", low)) or any(
-        tok in low for tok in ("_on", "_off", "daily_on", "daily_off", "total_on", "total_off")
-    )
+    if re.search(r"(_on|_off)$", low) or "_on" in low or "_off" in low:
+        return True
+    rules = rules or NamingRules(DEFAULT_RULES)
+    return any(src.lower() in low for src, _dst in rules.state_keywords)
 
 
 def is_large_on(node, art_w, art_h):
@@ -280,7 +356,7 @@ def is_large_on(node, art_w, art_h):
     return w >= art_w * 0.6 or h >= art_h * 0.4 or (w * h >= art_w * art_h * 0.2)
 
 
-def should_descend(node, art_w, art_h):
+def should_descend(node, art_w, art_h, rules: NamingRules | None = None):
     if not node.get("is_group") or not node.get("visible"):
         return False
     if node.get("is_artboard"):
@@ -290,7 +366,7 @@ def should_descend(node, art_w, art_h):
         return False
     if has_visible_text(node):
         return True
-    if any(looks_like_state_name(c.get("name") or "") for c in kids):
+    if any(looks_like_state_name(c.get("name") or "", rules) for c in kids):
         return True
     group_kids = [c for c in kids if c.get("is_group")]
     if len(group_kids) >= 2:
@@ -312,62 +388,68 @@ def normalize_text(text: str) -> str:
     return re.sub(r"[\r\n]+", " ", text or "").strip()
 
 
-FIXED_LABEL_TEXTS = {
-    "daily", "total", "home", "ranking", "shop", "rank", "store",
-}
-
-
 def has_heavy_effects(node) -> bool:
     """Typographic / decorative layer effects that should be baked as art_text."""
     keys = ("stroke", "frame", "gradient", "shadow", "glow", "bevel")
     return any(any(k in (e or "").lower() for k in keys) for e in (node.get("effects") or []))
 
 
-def is_fixed_label(text: str) -> bool:
-    return normalize_text(text).casefold() in FIXED_LABEL_TEXTS
+def is_fixed_label(text: str, rules: NamingRules) -> bool:
+    return normalize_text(text).casefold() in rules.fixed_labels
 
 
-def is_value_text(text: str) -> bool:
+def is_value_text(text: str, rules: NamingRules) -> bool:
     """Numbers, names, scores, and timers — rendered by the engine, not baked."""
     t = normalize_text(text)
     if not t:
         return False
-    if is_fixed_label(t):
+    if is_fixed_label(t, rules):
         return False
     if re.search(r"\d+\s*[hH小时].*\d+\s*[mM分]|\d+h\s*\d+m", t):
         return True
-    if re.search(r"^(score|level|分数)\b", t, re.I) or re.search(r"score\s*\d+", t, re.I):
+    if re.search(r"^(score|level)\b", t, re.I) or re.search(r"score\s*\d+", t, re.I):
         return True
-    # Place numbers are 1-2 digits only. "007" and other zero-padded ids are names.
+    # Place / rank numbers are 1-2 digits only. Three or more digits, or a
+    # leading-zero string, are treated as names / ids.
     if re.fullmatch(r"\d{1,2}", t):
         return True
-    if re.fullmatch(r"\d{3,}", t):
-        return True  # 007-style ids
-    if re.search(r"[A-Za-z]+\d+", t) or re.search(r"(myself|player\s*name)", t, re.I):
+    if re.fullmatch(r"0\d+", t) or re.fullmatch(r"\d{3,}", t):
         return True
-    if re.search(r"[A-Za-z]", t):
+    blob = t.casefold()
+    if any(k and k in blob for k in rules.value_name_keywords):
+        return True
+    if re.search(r"[A-Za-z]+\d+", t):
+        return True
+    if re.search(r"[A-Za-z].*\s+[A-Za-z]", t):
         return True
     if re.fullmatch(r"[\d.,\s]+", t):
         return True
     return False
 
 
-def classify_text(node) -> str:
+def classify_text(node, rules: NamingRules) -> str:
     text = node.get("text") or ""
-    name = node.get("name") or ""
-    if re.search(r"标题|title|美术字", name, re.I):
+    name = (node.get("name") or "").lower()
+    if any(k and k in name for k in rules.art_text_name_keywords):
         return "art_text"
-    if is_value_text(text):
+    if is_value_text(text, rules):
         return "dynamic_text"
-    if is_fixed_label(text):
-        # Preliminary; apply_pair_consistency may upgrade partners in an on/off set.
+    if is_fixed_label(text, rules):
         return "art_text" if has_heavy_effects(node) else "dynamic_text"
     if has_heavy_effects(node) and normalize_text(text) and not re.search(r"\d", normalize_text(text)):
         return "art_text"
     return "dynamic_text"
 
 
-def apply_pair_consistency(entries):
+def text_role(path: str, rules: NamingRules) -> str | None:
+    blob = (path or "").lower()
+    for role, tokens in rules.role_path_groups.items():
+        if any(tok and tok in blob for tok in tokens):
+            return role
+    return None
+
+
+def apply_pair_consistency(entries, rules: NamingRules):
     """The same text role in an on/off or tab pair must share one kind.
     If any member is art_text, all become art_text so no visible label is dropped.
     """
@@ -376,17 +458,10 @@ def apply_pair_consistency(entries):
         if entry.get("kind") not in {"dynamic_text", "art_text"}:
             continue
         content = normalize_text((entry.get("text") or {}).get("content") or "")
-        if not is_fixed_label(content):
+        if not content or is_value_text(content, rules):
             continue
-        path = (entry.get("source_path") or "").lower()
-        if "页签" in path or "/tab" in path or "group_tab" in path:
-            role = "tab_label"
-        elif "底部ui" in path or "navbar" in path:
-            role = "nav_label"
-        elif "顶部ui" in path or "topbar" in path:
-            role = "title_label"
-        else:
-            role = "label:" + content.casefold()
+        path = entry.get("source_path") or ""
+        role = text_role(path, rules) or ("label:" + content.casefold())
         groups.setdefault(role, []).append(entry)
     for members in groups.values():
         if any(m.get("kind") == "art_text" for m in members):
@@ -398,95 +473,97 @@ def apply_pair_consistency(entries):
                     )
 
 
-def infer_module(path: str, artboard_name: str) -> str:
-    blob = f"{artboard_name}/{path}".lower()
-    if any(s in blob for s in ("底部ui", "顶部ui", "navbar", "topbar", "底部/", "顶部/")):
-        # shared chrome defaults to common unless clearly shop-only etc.
-        if "商店" in blob or "shop" in blob:
-            return "shop"
-        return "common"
-    for src, dst in MODULE_TOKENS.items():
+def _path_relative_to_artboard(path: str, artboard_name: str) -> str:
+    path_l = (path or "").lower()
+    art_l = (artboard_name or "").lower()
+    if art_l and (path_l == art_l or path_l.startswith(art_l + "/")):
+        return path_l[len(art_l):].lstrip("/")
+    return path_l
+
+
+def infer_module(path: str, artboard_name: str, rules: NamingRules) -> str:
+    art_l = (artboard_name or "").lower()
+    rel = _path_relative_to_artboard(path, artboard_name)
+    # Shared chrome is decided from the layer path after stripping the artboard
+    # prefix, so a board named after the feature does not relabel its navbar.
+    if any(s and s in rel for s in rules.chrome_path_keywords):
+        for src, dst in rules.module_keywords:
+            if src.lower() in rel and dst != rules.chrome_module:
+                return dst
+        return rules.chrome_module
+    blob = f"{art_l}/{rel}"
+    for src, dst in rules.module_keywords:
         if src.lower() in blob:
             return dst
-    return "common"
+    slug = slugify(artboard_name)
+    return slug or rules.default_module
 
 
-def list_item_index(path: str):
-    m = re.search(r"/list\s*(\d+)(?:/|$)", path or "", re.I)
+def list_item_index(path: str, rules: NamingRules):
+    try:
+        m = re.search(rules.list_item_pattern, path or "", re.I)
+    except re.error:
+        m = None
     return m.group(1) if m else None
 
 
-def text_purpose_from_content(text: str, name: str):
+def text_purpose_from_content(text: str, name: str, rules: NamingRules):
     blob = f"{name} {text}".replace("\r", " ").replace("\n", " ")
     if re.search(r"\d+\s*[hH小时].*\d+\s*[mM分]|\d+h\s*\d+m", blob):
         return "timer"
-    if re.search(r"^\s*(score|level|分数)\b", blob, re.I) or re.search(r"score\s*\d+", blob, re.I):
+    if re.search(r"^\s*(score|level)\b", blob, re.I) or re.search(r"score\s*\d+", blob, re.I):
         return "score"
-    # Place numbers are short (1-2 digits). "007" and other zero-padded ids are names.
-    if re.fullmatch(r"\s*\d{1,2}\s*", (text or "").replace("\r", "").replace("\n", "")):
+    compact = (text or "").replace("\r", "").replace("\n", "").strip()
+    if re.fullmatch(r"\d{1,2}", compact):
         return "place"
-    if re.search(r"player\s*name|myself|名字", blob, re.I):
+    if re.fullmatch(r"0\d+", compact) or re.fullmatch(r"\d{3,}", compact):
         return "name"
-    if re.search(r"\b(daily|total|home|ranking)\b", blob, re.I):
-        return re.search(r"\b(daily|total|home|ranking)\b", blob, re.I).group(1).lower()
+    low = blob.casefold()
+    if any(k and k in low for k in rules.value_name_keywords):
+        return "name"
+    if is_fixed_label(text or "", rules) or is_fixed_label(name, rules):
+        return slugify(normalize_text(text) or name)
     if text and re.search(r"[A-Za-z]", text) and not re.search(r"score|level", text, re.I):
         return "name"
     return None
 
 
-def infer_type_purpose_state(node, module: str):
+def infer_type_purpose_state(node, module: str, rules: NamingRules):
     name = node.get("name") or ""
     path = (node.get("path") or "").lower()
     key = name.strip().lower()
     typ = purpose = None
     state = ""
-    if key in SPECIAL_LAYER_NAMES:
-        typ, purpose, state = SPECIAL_LAYER_NAMES[key]
-    if re.fullmatch(r"no\.?\s*1", key):
-        typ, purpose, state = "icon", "medal", "gold"
-    elif re.fullmatch(r"no\.?\s*2", key):
-        typ, purpose, state = "icon", "medal", "silver"
-    elif re.fullmatch(r"no\.?\s*3", key):
-        typ, purpose, state = "icon", "medal", "bronze"
-    typ = typ or find_token(name + " " + path, TYPE_TOKENS)
-    purpose = purpose or find_token(name + " " + path, PURPOSE_TOKENS)
-    state = state or find_token(name + " " + path, STATE_TOKENS) or ""
-    item_n = list_item_index(node.get("path") or "")
+    if key in rules.special_layer_names:
+        typ, purpose, state = rules.special_layer_names[key]
+    for spec in rules.path_specials:
+        if spec["path_includes"] and not any(tok and tok in path for tok in spec["path_includes"]):
+            continue
+        if spec["name"] and key != spec["name"]:
+            continue
+        if spec["name_prefix"] and not key.startswith(spec["name_prefix"]):
+            continue
+        if not spec["name"] and not spec["name_prefix"]:
+            continue
+        typ = typ or spec["type"]
+        purpose = purpose or spec["purpose"]
+        state = state or spec["state"]
+    typ = typ or find_token(name + " " + path, rules.type_keywords)
+    purpose = purpose or find_token(name + " " + path, rules.purpose_keywords)
+    state = state or find_token(name + " " + path, rules.state_keywords) or ""
+    item_n = list_item_index(node.get("path") or "", rules)
     if node.get("is_text") or node.get("kind_export") in {"dynamic_text", "art_text"}:
-        purpose = text_purpose_from_content(node.get("text") or "", name) or purpose
-    # Nav chrome
-    if "底部ui" in path or "navbar" in path:
-        typ = typ or ("icon" if node.get("kind") and "smart" in (node.get("kind") or "").lower() else typ)
-        if key in {"1", "2", "3", "3-2", "3-3"}:
-            typ, purpose = "btn", "navtab"
-        elif key == "bottom":
-            typ, purpose = "bg", "navbar"
-        elif "主页" in name:
-            typ, purpose = "icon", "home"
-        elif "排行" in name:
-            typ, purpose = "icon", "rank"
-        elif key.startswith("图层"):
-            typ, purpose = typ or "icon", purpose or "nav"
-    if "顶部ui" in path or "topbar" in path:
-        if "横线" in name:
-            typ, purpose = "deco", "hline"
-        elif "bg" in key or "底" in name:
-            typ, purpose = typ or "bg", purpose or "topbar"
-    if re.search(r"秒表", name):
-        typ, purpose = "icon", "timer"
-    if re.search(r"底衬", name):
-        typ, purpose = typ or "bg", purpose or "timer"
+        purpose = text_purpose_from_content(node.get("text") or "", name, rules) or purpose
     if item_n:
-        if key == "panel_list" or purpose in {"item", "base"}:
-            typ, purpose = "bg", f"item{item_n}"
-        elif typ == "icon" and purpose == "avatar":
-            purpose = f"avatar_item{item_n}"
-        elif typ == "icon" and purpose == "medal":
-            purpose = f"medal_item{item_n}" if not state else purpose
+        if typ in {None, "bg", "item"} and (purpose in {None, "item", "base", "list"} or typ == "bg"):
+            typ = typ or "bg"
+            purpose = f"item{item_n}"
+        elif typ == "icon" and purpose:
+            if not state:
+                purpose = f"{purpose}_item{item_n}"
         elif purpose in {"score", "name", "place"}:
             purpose = f"{purpose}_item{item_n}"
-    # Self row: Myself / 自己 in the same item path.
-    if item_n and re.search(r"myself|自己", path, re.I) and not state:
+    if item_n and not state and any(k and k in path for k in rules.self_row_keywords):
         state = "self"
     if node.get("is_text") or node.get("kind_export") in {"dynamic_text", "art_text"}:
         typ = typ or "img"
@@ -494,12 +571,12 @@ def infer_type_purpose_state(node, module: str):
         if purpose in {"bg", "btn", "icon", "frame", "tab", "item", "deco"}:
             purpose = "label"
     if typ is None:
-        if purpose in {"medal", "crown", "avatar", "lock", "coin", "star", "timer"}:
-            typ = "icon"
-        elif purpose in {"navbar", "topbar", "screen", "base", "item", "list", "title", "podium", "slot"}:
+        if purpose in {"navbar", "topbar", "screen", "base", "item", "list", "title", "slot"}:
             typ = "bg"
         elif purpose in {"hline", "vline", "divider"}:
             typ = "deco"
+        elif purpose and purpose.split("_")[0] in {"avatar", "medal", "icon"}:
+            typ = "icon"
         elif (node.get("width") or 0) >= 200 and (node.get("height") or 0) >= 80:
             typ = "bg"
         elif (node.get("width") or 0) <= 200 and (node.get("height") or 0) <= 200:
@@ -507,9 +584,8 @@ def infer_type_purpose_state(node, module: str):
         else:
             typ = "img"
     if not purpose:
-        # Fallback purpose: English tokens in the layer name, else a stable id tag.
         latin = slugify(name)
-        if latin and latin not in SKIP_TOKENS and not re.fullmatch(r"l?\d+", latin):
+        if latin and latin not in rules.skip_tokens and not re.fullmatch(r"l?\d+", latin):
             purpose = latin
         else:
             purpose = f"l{node.get('layer_id') or 0}"
@@ -529,6 +605,7 @@ def unique_name(parts, used):
         n += 1
     used.add(candidate)
     return candidate
+
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +688,8 @@ def list_item_tag(path: str) -> str:
     return ""
 
 
-def build_entries(artboard, art_w, art_h, module_hint, warnings):
+def build_entries(artboard, art_w, art_h, module_hint, warnings, rules=None):
+    rules = rules or NamingRules(DEFAULT_RULES)
     used = set()
     entries = []
     tree_nodes = []
@@ -649,7 +727,7 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
         kind = "image"
         text_attrs = None
         if node.get("is_text") and not clipped:
-            kind = classify_text(node)
+            kind = classify_text(node, rules)
             text_attrs = {
                 "content": node.get("text") or "",
                 "font": None,
@@ -661,8 +739,8 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
                 "effects": list(node.get("effects") or []),
             }
 
-        module = infer_module(node.get("path") or "", module_hint)
-        typ, purpose, state = infer_type_purpose_state({**node, "kind_export": kind}, module)
+        module = infer_module(node.get("path") or "", module_hint, rules)
+        typ, purpose, state = infer_type_purpose_state({**node, "kind_export": kind}, module, rules)
         if kind in {"dynamic_text", "art_text"} and typ not in {"img"}:
             typ = "img"
         name = unique_name([module, typ, purpose, state], used)
@@ -709,7 +787,7 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
 
     def walk(node, parent_name, z_base=0):
         children_out = []
-        if should_descend(node, art_w, art_h):
+        if should_descend(node, art_w, art_h, rules):
             container = {
                 "name": None,
                 "kind": "group",
@@ -717,8 +795,8 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
                 "children": [],
             }
             # Name the container for hierarchy only (not a slice).
-            module = infer_module(node.get("path") or "", module_hint)
-            typ, purpose, state = infer_type_purpose_state(node, module)
+            module = infer_module(node.get("path") or "", module_hint, rules)
+            typ, purpose, state = infer_type_purpose_state(node, module, rules)
             # groups use a name that won't collide with slices: prefix group_
             gname = unique_name(["group", module, typ, purpose, state], used)
             container["name"] = gname
@@ -730,7 +808,7 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
                     continue
                 if not base.get("visible"):
                     continue
-                if should_descend(base, art_w, art_h) and not clipped:
+                if should_descend(base, art_w, art_h, rules) and not clipped:
                     child = walk(base, gname)
                     if child:
                         container["children"].append(child)
@@ -743,7 +821,7 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
         return emit(node, [], parent_name, z_base, [])
 
     tree = walk(artboard, None)
-    apply_pair_consistency(entries)
+    apply_pair_consistency(entries, rules)
     by_name = {e["name"]: e for e in entries}
 
     def sync_tree_kinds(node):
@@ -761,30 +839,83 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
     return entries, tree_nodes
 
 
-def find_artboard(roots, needle):
+def list_artboards(roots):
+    found = []
+
+    def walk(nodes):
+        for node in nodes:
+            if node.get("is_artboard"):
+                found.append(node)
+            elif node.get("children"):
+                walk(node["children"])
+
+    walk(roots)
+    return found
+
+
+def make_canvas_target(psd, roots):
+    return {
+        "name": "canvas",
+        "path": "",
+        "depth": 0,
+        "index_in_parent": 0,
+        "layer_id": None,
+        "kind": "artboard",
+        "is_group": True,
+        "is_artboard": True,
+        "is_text": False,
+        "is_adjustment": False,
+        "visible": True,
+        "opacity": 255,
+        "blend_mode": "NORMAL",
+        "clipping": False,
+        "bbox": [0, 0, int(psd.width), int(psd.height)],
+        "width": int(psd.width),
+        "height": int(psd.height),
+        "effects": [],
+        "text": None,
+        "children": roots,
+        "source_is_canvas": True,
+    }
+
+
+def select_targets(roots, needle, psd=None):
+    """Return one or more infer targets.
+
+    --artboard <name or id> selects a single artboard (or top-level layer).
+    With no --artboard, every visible top-level artboard is processed; if the
+    document has none, the whole canvas is treated as one target.
+    """
+    artboards = list_artboards(roots)
     if needle is None:
-        artboards = [n for n in roots if n.get("is_artboard")]
-        if len(artboards) == 1:
-            return artboards[0]
-        if not artboards and len(roots) == 1:
-            return roots[0]
-        names = [(n.get("layer_id"), n.get("name")) for n in artboards]
-        raise SystemExit(f"multiple artboards, pass --artboard: {names}")
+        visible = [a for a in artboards if a.get("visible")]
+        if visible:
+            return visible
+        if psd is not None:
+            return [make_canvas_target(psd, roots)]
+        if roots:
+            return [r for r in roots if r.get("visible")] or list(roots)
+        raise SystemExit("no visible artboard or canvas target")
     raw = str(needle)
-    for n in roots:
-        if not n.get("is_artboard") and n.get("depth") != 1:
-            continue
-        if raw == str(n.get("layer_id")) or raw == (n.get("name") or ""):
-            return n
-        if n.get("is_artboard"):
-            found = find_artboard_in([n], raw)
-            if found:
-                return found
-    # search all artboards recursively
+    for node in artboards + [r for r in roots if r not in artboards]:
+        if raw == str(node.get("layer_id")) or raw == (node.get("name") or ""):
+            return [node]
+        found = find_artboard_in([node], raw)
+        if found:
+            return [found]
     found = find_artboard_in(roots, raw)
     if found:
-        return found
+        return [found]
     raise SystemExit(f"artboard not found: {needle}")
+
+
+def target_slug(target, used):
+    slug = slugify(target.get("name") or "") or (
+        f"artboard_{target.get('layer_id')}" if target.get("layer_id") is not None else "canvas"
+    )
+    return unique_name([slug], used)
+
+
 
 
 def find_artboard_in(nodes, raw):
@@ -904,61 +1035,95 @@ def cmd_infer(args):
         roots.append(collect_layer(layer, [], 1, i, warnings))
     print(f"tree walked in {time.time()-t1:.1f}s, top-level {len(roots)}", flush=True)
 
-    artboard = find_artboard(roots, args.artboard)
-    if not artboard.get("visible"):
-        raise SystemExit(f"artboard is hidden: {artboard.get('name')}")
-    bbox = artboard.get("bbox") or [0, 0, artboard["width"], artboard["height"]]
-    art_w, art_h = artboard["width"], artboard["height"]
-    print(f"artboard {artboard.get('name')} id={artboard.get('layer_id')} {art_w}x{art_h} bbox={bbox}", flush=True)
+    rules = NamingRules.load(getattr(args, "rules", None))
+    targets = select_targets(roots, args.artboard, psd=psd)
+    hidden = [t for t in targets if not t.get("visible")]
+    if hidden and args.artboard:
+        raise SystemExit(f"artboard is hidden: {hidden[0].get('name')}")
+    targets = [t for t in targets if t.get("visible")]
+    if not targets:
+        raise SystemExit("no visible artboard or canvas target")
 
-    t2 = time.time()
-    entries, tree = build_entries(artboard, art_w, art_h, artboard.get("name") or "", warnings)
-    print(f"inferred {len(entries)} entries in {time.time()-t2:.1f}s", flush=True)
-
-    # Composite artboard for preview (visible layers only; FX may be missing).
-    t3 = time.time()
-    preview_base = artboard_image(artboard, warnings)
-    print(f"artboard composite in {time.time()-t3:.1f}s size={preview_base.size}", flush=True)
-
-    kinds = Counter(e["kind"] for e in entries)
-    manifest = {
-        "schema": SCHEMA_MANIFEST,
-        "status": "pending_review",
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "source": {
-            "file": str(psd_path),
-            "doc_size": [int(psd.width), int(psd.height)],
-            "color_mode": enum_val(getattr(psd, "color_mode", None)),
-            "depth": getattr(psd, "depth", None),
-            "artboard": {
-                "id": artboard.get("layer_id"),
-                "name": artboard.get("name"),
-                "bounds": bbox,
-                "size": [art_w, art_h],
+    def infer_one(target, dest: Path, time_base):
+        dest.mkdir(parents=True, exist_ok=True)
+        bbox = target.get("bbox") or [0, 0, target["width"], target["height"]]
+        art_w, art_h = target["width"], target["height"]
+        print(
+            f"target {target.get('name')} id={target.get('layer_id')} {art_w}x{art_h} bbox={bbox}",
+            flush=True,
+        )
+        t2 = time.time()
+        entries, tree = build_entries(
+            target, art_w, art_h, target.get("name") or "", warnings, rules
+        )
+        print(f"inferred {len(entries)} entries in {time.time()-t2:.1f}s", flush=True)
+        t3 = time.time()
+        preview_base = artboard_image(target, warnings)
+        print(f"artboard composite in {time.time()-t3:.1f}s size={preview_base.size}", flush=True)
+        kinds = Counter(e["kind"] for e in entries)
+        manifest = {
+            "schema": SCHEMA_MANIFEST,
+            "status": "pending_review",
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source": {
+                "file": str(psd_path),
+                "doc_size": [int(psd.width), int(psd.height)],
+                "color_mode": enum_val(getattr(psd, "color_mode", None)),
+                "depth": getattr(psd, "depth", None),
+                "artboard": {
+                    "id": target.get("layer_id"),
+                    "name": target.get("name"),
+                    "bounds": bbox,
+                    "size": [art_w, art_h],
+                },
             },
-        },
-        "naming_rule": "模块_类型_用途_状态，小写英文；禁止直接使用 PSD 图层名",
-        "review_gate": "Edit this JSON to confirm. Nothing is exported until status is set to confirmed.",
-        "entries": strip_runtime(entries),
-        "tree": tree,
-        "warnings": warnings,
-        "stats": {
-            "entry_count": len(entries),
-            "by_kind": dict(kinds),
-            "infer_sec": round(time.time() - t0, 2),
-        },
-    }
-    manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    preview_path = out_dir / "preview_annotated.png"
-    annotate_preview(
-        preview_base,
-        manifest["entries"],
-        (bbox[0], bbox[1]),
-        preview_path,
-        f"{artboard.get('name')}  {len(entries)} slices  (review preview, FX may be missing)",
-    )
-    print(json.dumps({"manifest": str(manifest_path), "preview": str(preview_path), "stats": manifest["stats"]}, ensure_ascii=False, indent=2))
+            "naming_rule": "模块_类型_用途_状态，小写英文；禁止直接使用 PSD 图层名",
+            "naming_rules_file": str(args.rules) if getattr(args, "rules", None) else None,
+            "review_gate": "Edit this JSON to confirm. Nothing is exported until status is set to confirmed.",
+            "entries": strip_runtime(entries),
+            "tree": tree,
+            "warnings": warnings,
+            "stats": {
+                "entry_count": len(entries),
+                "by_kind": dict(kinds),
+                "infer_sec": round(time.time() - time_base, 2),
+            },
+        }
+        manifest_path = dest / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        preview_path = dest / "preview_annotated.png"
+        annotate_preview(
+            preview_base,
+            manifest["entries"],
+            (bbox[0], bbox[1]),
+            preview_path,
+            f"{target.get('name')}  {len(entries)} slices  (review preview, FX may be missing)",
+        )
+        return {
+            "manifest": str(manifest_path),
+            "preview": str(preview_path),
+            "stats": manifest["stats"],
+            "artboard": manifest["source"]["artboard"],
+        }
+
+    slug_used = set()
+    if len(targets) == 1:
+        result = infer_one(targets[0], out_dir, t0)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    index = []
+    for target in targets:
+        slug = target_slug(target, slug_used)
+        dest = out_dir / slug
+        item = infer_one(target, dest, time.time())
+        item["out_dir"] = str(dest)
+        item["slug"] = slug
+        index.append(item)
+    index_path = out_dir / "index.json"
+    payload = {"targets": index, "count": len(index)}
+    index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"index": str(index_path), **payload}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1580,7 +1745,17 @@ def build_parser():
     s = sub.add_parser("infer", help="Infer slicing manifest + annotated preview from a PSD/PSB")
     s.add_argument("--psd", required=True)
     s.add_argument("--out-dir", required=True)
-    s.add_argument("--artboard", default=None, help="Artboard name or layer_id (required if several)")
+    s.add_argument(
+        "--artboard",
+        default=None,
+        help="Artboard name or layer_id. If omitted, every visible top-level artboard is processed "
+             "(or the whole canvas when the document has none).",
+    )
+    s.add_argument(
+        "--rules",
+        default=None,
+        help="Optional naming-rules JSON (see naming_rules.example.json). Generic defaults are used when omitted.",
+    )
     s.set_defaults(func=cmd_infer)
 
     s = sub.add_parser("preview", help="Redraw annotated preview from a (edited) manifest")

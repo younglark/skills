@@ -214,17 +214,17 @@ await out.write(JSON.stringify(log, null, 2));
 
 ## 9. Agent 切图工作流
 
-把可见图层切成游戏引擎可导入的 1x PNG，并产出一份引擎无关的中间布局 JSON。细节、schema、命名规则、九宫格启发式和实测见 [references/slicing.md](references/slicing.md)。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)。
+把可见图层切成游戏引擎可导入的 1x PNG，并产出一份引擎无关的中间布局 JSON。细节、schema、命名规则、九宫格启发式和实测见 [references/slicing.md](references/slicing.md)。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
 
 **流程（确认前不导出）：**
 
-1. **推断（离线）**：用 `psd-tools` 读图层树，只看可见图层（隐藏的完全忽略，状态要靠美术在 PSD 里显式打开）。为每条切图生成 `layer_id`、源图层名/路径（仅供对照）、规范名 `模块_类型_用途_状态`（小写，禁止直接用 PSD 图层名）、类型 `image` | `nine_slice` | `dynamic_text` | `art_text`，以及按像素分析算出的九宫格边距。底图、高亮、图标、文字是独立资源，不要烘焙到一张图里。
+1. **推断（离线）**：用 `psd-tools` 读图层树，只看可见图层（隐藏的完全忽略，状态要靠美术在 PSD 里显式打开）。`--artboard <画板名或id>` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。项目命名词表通过 `--rules` 传入，不写进助手核心。为每条切图生成 `layer_id`、源图层名/路径（仅供对照）、规范名 `模块_类型_用途_状态`（小写，禁止直接用 PSD 图层名）、类型 `image` | `nine_slice` | `dynamic_text` | `art_text`，以及按像素分析算出的九宫格边距。底图、高亮、图标、文字是独立资源，不要烘焙到一张图里。
 2. **审核门闩**：输出标注预览图（框出每个切图、标规范名和九宫格线）和 manifest JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。
-3. **导出（`.psjs`）**：按 `layer_id`（及可见剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份，不去重。`dynamic_text` 不出图，只导出文本、字体 PostScript 名、字号、颜色、描边、对齐等属性；`art_text` 出图。
+3. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从旁边的作业 JSON 读路径。按 `layer_id`（及可见剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份，不去重。`dynamic_text` 不出图，只导出文本、字体 PostScript 名、字号、颜色、描边、对齐等属性；`art_text` 出图。
 4. **布局 JSON**：引擎无关的中间格式，记录层级、可见尺寸（含效果）、逻辑尺寸（不含效果）、按逻辑尺寸中心计算的锚点、九宫格边距、文本属性和对应图片。各引擎导入器自己写，不在本 skill 里。
 5. **校验**：按元数据把切图用 src-over 拼回去，和 PS 整图画板对比像素差 / CIEDE2000 ΔE；同时报告 Pillow 渲染动态文字后的数字、以及遮罩动态文字区域后的数字，并列出误差最大的 10 条。再检查漏切、重名、空图。
 
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
 
-**实测（Windows / PS 2026，排行榜.psb 副本，画板「排行榜_总榜」1080×2340，Asia/Shanghai）：** 修后重跑推断 65 条（最终 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4；Daily/Total 与带效果的固定文案为 `art_text`，「007」为动态玩家名），约 22 秒（需提高 `psd-tools` 的 `ParseLimits`，渐变合成需 scipy）；审核预览已生成，测试中将自动清单视为已确认；导出 65/65 成功、43 张 PNG，约 42 秒；漏切/重名/空图为 0。可见框按 trim 内缩量对齐后，遮罩动态文字：mean ΔE **0.047**、PSNR **46.24 dB**（修前为 2.599 / 20.54 dB）。用原字体 Pillow 近似动态文字后全图 mean ΔE 1.041、PSNR 23.39 dB，残差几乎都在文字本身（hinting / 描边，非切图错位）。遮罩后约 0.15% 像素差 >16，集中在底栏重叠层，属未模拟 PS 混合模式的预期残差。细节与第一轮对比见 [references/slicing.md](references/slicing.md) 第 8 节。
+**实测（Windows / PS 2026，一份列表界面 PSB 副本上的 1080×2340 画板，65 个可见元素，Asia/Shanghai）：** 修后重跑推断 65 条（最终 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4；成对页签与带效果的固定文案为 `art_text`，带前导零的数字串为动态玩家名），约 22 秒（需提高 `psd-tools` 的 `ParseLimits`，渐变合成需 scipy）；审核预览已生成，测试中将自动清单视为已确认；导出 65/65 成功、43 张 PNG，约 42 秒；漏切/重名/空图为 0。可见框按 trim 内缩量对齐后，遮罩动态文字：mean ΔE **0.047**、PSNR **46.24 dB**（修前为 2.599 / 20.54 dB）。用文档字体 Pillow 近似动态文字后全图 mean ΔE 1.041、PSNR 23.39 dB，残差几乎都在文字本身（hinting / 描边，非切图错位）。遮罩后约 0.15% 像素差 >16，集中在底栏重叠层，属未模拟 PS 混合模式的预期残差。细节与第一轮对比见 [references/slicing.md](references/slicing.md) 第 8 节。随后把项目命名词表移到仓库外的 `--rules` 再跑同一副本，遮罩后 PSNR 仍为 46.24 dB、mean ΔE 0.047、问题数为 0；不传 `--rules` 时 kind 不变，但规范名更泛化（模块落在 `main`，缺少用途词）。
 

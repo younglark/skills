@@ -5,10 +5,10 @@
 助手子命令：
 
 ```text
-python slicing_helper.py infer --psd design.psb --out-dir out --artboard 排行榜_总榜
+python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画板名或id>] [--rules naming_rules.json]
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
-python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir path/to/fonts]
+python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>]
 ```
 
 依赖：`psd-tools`、Pillow、numpy。渐变填充的预览/九宫格分析还需要 `scipy`（`pip install scipy` 或 `psd-tools[composite]`）。大 PSD/PSB 打开时把 `ParseLimits.max_objects` 设为 `None`，否则默认 1,000,000 会直接失败（实测）。
@@ -18,7 +18,8 @@ python slicing_helper.py validate --layout out/layout.json --slices-dir out/slic
 ## 1. 推断（只处理可见图层）
 
 - 隐藏图层整棵子树都忽略。交互状态必须由美术在 PSD 里显式打开，助手不会把隐藏的 on/off 层标出来。
-- 多画板文档必须用 `--artboard`（名称或 `layer_id`）指定目标画板，不要一次切整份画布。
+- `--artboard` 可选，值为画板名或 `layer_id`。省略时处理所有可见的顶层画板；文档没有画板时，把整份画布当作一个目标。多个目标时，每个画板写到 `--out-dir/<slug>/`，并在 `--out-dir/index.json` 里列出。
+- 项目相关的命名词表（关键词 → 模块/类型/用途/状态、固定文案词）放在外部规则文件里，用 `--rules` 加载。示例见 [examples/naming_rules.example.json](../examples/naming_rules.example.json)。不传 `--rules` 时使用内置的通用默认规则，核心不绑定某一份 PSD。
 - 含可见文字的组、带 `*_on` / `*_off` 状态子层的组、以及「大底板 + 小图标」的组要下钻，把底图、高亮、图标、文字拆成独立资源，不要烘焙成一张图。
 - 纯图形组（如奖牌、头像框）以及叶子层（像素 / 形状 / 智能对象）连同其上方可见剪贴层，作为一条切图，记录 `select_ids`。
 - 调整图层、空图层（宽或高为 0）跳过。
@@ -40,9 +41,9 @@ python slicing_helper.py validate --layout out/layout.json --slices-dir out/slic
 
 `dynamic_text` 与 `art_text` 按内容语义判断：
 
-- 分数、倒计时、玩家名、以及 **1–2 位**名次数字 → `dynamic_text`。三位及以上数字（如 `"007"`）当作玩家名，也是 `dynamic_text`，不要当成名次。
-- 固定 UI 文案（如 Daily / Total、导航上的 Ranking / Home / Shop）若带描边、渐变、投影、外发光、斜面等较重效果 → `art_text`，由 PS 栅格化，避免拼图缺字。
-- 同一文案角色在 on/off 或页签成对状态里必须同一 `kind`。若组里任一条是 `art_text`，其余一并升为 `art_text`（例如 Daily 与 Total）。导航下的 Ranking 与顶栏标题 Ranking 是不同角色，不必强行相同。
+- 分数、倒计时、玩家名、以及 **1–2 位**名次数字 → `dynamic_text`。三位及以上、或带前导零的数字串按名字处理，也是 `dynamic_text`，不要当成名次。
+- 固定 UI 文案（词表来自 `--rules` 的 `fixed_labels`）若带描边、渐变、投影、外发光、斜面等较重效果 → `art_text`，由 PS 栅格化，避免拼图缺字。无规则文件时，无数字且带这类效果的短标签也会判为 `art_text`。
+- 成对页签/状态里同一文案角色必须同一 `kind`。若组里任一条是 `art_text`，其余一并升为 `art_text`。导航标签与顶栏标题是不同角色，不必强行相同。角色分组的路径关键词也来自规则文件（缺省时使用通用的 `tab` / `navbar` / `topbar` 等）。
 - 审核时以 JSON 为准。
 
 ---
@@ -60,7 +61,7 @@ python slicing_helper.py validate --layout out/layout.json --slices-dir out/slic
 
 ## 3. 导出
 
-用 [examples/export_slices.psjs](../examples/export_slices.psjs)。把文件顶部的 `ROOT_URL`、`SOURCE_URL`、`SOURCE_PATH_HINT` 改成任务目录；不要加额外 CLI 参数。
+用 [examples/export_slices.psjs](../examples/export_slices.psjs)。脚本顶部只有一个常量 `CONFIG_URL`，指向任务目录里的作业 JSON（模板：[examples/export_config.example.json](../examples/export_config.example.json)）。不要把路径、文档名或图层 id 写进脚本；不要加额外 CLI 参数。
 
 - 只打开（或按路径复用）任务指定的那份 PSD/PSB 副本，核对 `doc.path`。用完若是脚本自己打开的，`closeWithoutSaving()`；不要覆盖保存。
 - 每条描述符 `_options.dialogOptions = "silent"`。`executeAsModal` + 顶层 `await`，对源文档 `suspendHistory`。
@@ -83,14 +84,14 @@ python slicing_helper.py build-layout ...
 
 ## 4. 命名规则
 
-规范名：`模块_类型_用途_状态`，全小写，下划线分隔，**禁止**直接使用 PSD 图层名。
+规范名：`模块_类型_用途_状态`，全小写，下划线分隔，**禁止**直接使用 PSD 图层名。例如 `<module>_bg_item_normal`。
 
-- **模块**：从画板或路径推断，如 `rank` / `shop` / `popup` / `common`（顶栏、底栏等公共铬）。
-- **类型**：`bg` / `btn` / `icon` / `frame` / `tab` / `item` / `deco` / `img` / `mask`。文本切图用 `img`。
-- **用途**：`navbar`、`topbar`、`item3`、`avatar_item1`、`medal`、`score_item2`、`timer` 等。列表实例把序号编进用途，不去重。
-- **状态**：有才写，如 `on` / `off` / `gold` / `silver` / `bronze` / `self` / `empty` / `full`。
+- **模块**：默认取画板名的拉丁 slug，或规则里的 `default_module`（通常是 `main`）。公共铬（顶栏/底栏等，路径命中 `chrome_path_keywords`）用 `chrome_module`（默认 `common`）。更多模块关键词写在规则文件的 `module_keywords`。
+- **类型**：`bg` / `btn` / `icon` / `frame` / `tab` / `item` / `deco` / `img` / `mask`。文本切图用 `img`。类型关键词、特殊图层名见规则文件。
+- **用途**：由规则词表、文本语义（分数/倒计时/名字/名次）或图层名 slug 得出。列表实例把序号编进用途（如 `item1`、`score_item2`），不去重。
+- **状态**：有才写，如 `on` / `off` / `normal` / `empty` / `full`；项目特有的状态词放在规则文件的 `state_keywords`。
 
-重名时追加 `_2`、`_3`。助手会做中英文关键词映射，映射不到就用稳定的 `l{layer_id}` 兜底，仍然不要回退成原始图层名。
+重名时追加 `_2`、`_3`。映射不到就用稳定的 `l{layer_id}` 兜底，仍然不要回退成原始图层名。
 
 ---
 
@@ -113,30 +114,30 @@ python slicing_helper.py build-layout ...
   "schema": "psjs-layout/v1",
   "source": {
     "file": "design.psb",
-    "doc_size": [9340, 4036],
+    "doc_size": [2400, 1600],
     "artboard": {
-      "id": 5771,
-      "name": "排行榜_总榜",
-      "bounds": [1180, 0, 2260, 2340],
-      "size": [1080, 2340]
+      "id": 1001,
+      "name": "Board_Main",
+      "bounds": [0, 0, 1080, 1920],
+      "size": [1080, 1920]
     }
   },
   "nodes": [
     {
-      "id": "rank_bg_item1_normal",
-      "name": "rank_bg_item1_normal",
+      "id": "main_bg_item_normal",
+      "name": "main_bg_item_normal",
       "kind": "nine_slice",
-      "layer_id": 5996,
-      "select_ids": [5996],
-      "parent": "group_rank_item_list_1",
-      "source_name": "panel_list",
-      "source_path": "排行榜_总榜/排行榜/list/list 1/panel_list",
+      "layer_id": 2002,
+      "select_ids": [2002],
+      "parent": "group_main_item_list_1",
+      "source_name": "panel",
+      "source_path": "Board_Main/list/list 1/panel",
       "visible_bounds": {"left": 14, "top": 512, "right": 1076, "bottom": 734},
       "logical_bounds": {"left": 14, "top": 523, "right": 1064, "bottom": 723},
       "anchor": {"x": 539, "y": 623},
       "pivot": {"x": 0.5, "y": 0.5},
       "nine_slice": {"left": 30, "top": 30, "right": 29, "bottom": 29},
-      "image": "rank_bg_item1_normal.png",
+      "image": "main_bg_item_normal.png",
       "text": null
     }
   ]
@@ -170,7 +171,7 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 
 ## 8. 实测（Windows / Photoshop 2026）
 
-对象：`排行榜.psb` 的副本（未改、未保存、未关闭用户可能打开的原文档或「排行榜-恢复的.psb」）。目标画板「排行榜_总榜」（`layer_id` 5771，1080×2340）。时间均为 Asia/Shanghai（UTC+8）。
+对象：一份多画板 UI PSB 的**副本**（未改、未保存、未关闭用户可能打开的原文档或其它未指定文档）。实测画板是一个 1080×2340 的列表界面，65 个可见元素。时间均为 Asia/Shanghai（UTC+8）。项目词表不进技能仓库，回归时用仓库外的 `--rules` 文件。
 
 ### 8.1 第一轮（修前）
 
@@ -178,12 +179,12 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 |------|------|
 | 推断 | 65 条；约 82.9 秒（打开 2.4 s，条目合成 64.6 s，画板合成 15.8 s）。初步类型：image 23、nine_slice 16、dynamic_text 24、art_text 2。用导出 PNG 重测九宫格后：image 18、nine_slice 21、dynamic_text 24、art_text 2。 |
 | 预览 | 已写出标注预览。测试中将自动清单视为已确认。 |
-| 导出 | 65/65 成功（41 张 PNG + 24 条仅属性的动态文字），另写出 1080×2340 整图。墙钟约 43.1 秒（15:36:48–15:37:31）。脚本打开副本（doc id 59）后不保存关闭；`docs_before` / `docs_after` 均为空。 |
+| 导出 | 65/65 成功（41 张 PNG + 24 条仅属性的动态文字），另写出 1080×2340 整图。墙钟约 43.1 秒（15:36:48–15:37:31）。脚本打开副本后不保存关闭；`docs_before` / `docs_after` 均为空。 |
 | 校验 | 漏切 / 重名 / 空图：0。全图：MAE 10.225，PSNR 17.65 dB，mean ΔE 4.082。遮罩动态文字后：MAE 6.277，PSNR 20.54 dB，mean ΔE 2.599，p95 ΔE 13.569，ΔE>2 占 16.423%，ΔE>5 占 9.01%。 |
 
-当时的问题：Daily 为 `art_text`、Total 为 `dynamic_text`，拼图缺 Total；「007」被当成名次（助手随后改为仅 1–2 位数字是名次，本轮清单未重跑）；几乎每条切图周围有一圈描边状残差。
+当时的问题：成对页签里同一文案角色一种判为 `art_text`、另一种判为 `dynamic_text`，拼图缺字；带前导零的数字串被当成名次；几乎每条切图周围有一圈描边状残差。
 
-描边残差的根因（已用逐条 best-fit 和一次 PS probe 核实，不是色管、JPEG 或预乘）：「从图层新建」得到的临时文档与源画布对齐，DOM `layer.bounds` 比 trim 后的不透明区域更松。第一轮把这个较松框的左上角当成 PNG 原点，没有加上被 trim 掉的左边/上边像素。trim 后 `layer.bounds.left/top` 是内缩量（常为负数，如奖牌 `-5,-6`）。紧致原点 = `before.left - after.left`。不透明像素（A≥250）在正确原点上与 PS 整图完全重合（mae=0）。偏移不是全局 +2,+2：头像约 (0,+2)，奖牌约 (+5,+6) 或 (+3,+4)，卡片/美术字约 (+2,+2)。
+描边残差的根因（已用逐条 best-fit 和一次 PS probe 核实，不是色管、JPEG 或预乘）：「从图层新建」得到的临时文档与源画布对齐，DOM `layer.bounds` 比 trim 后的不透明区域更松。第一轮把这个较松框的左上角当成 PNG 原点，没有加上被 trim 掉的左边/上边像素。trim 后 `layer.bounds.left/top` 是内缩量（常为负数，如 `-5,-6`）。紧致原点 = `before.left - after.left`。不透明像素（A≥250）在正确原点上与 PS 整图完全重合（mae=0）。偏移不是全局 +2,+2：有的切图约 (0,+2)，有的约 (+5,+6) 或 (+3,+4)，卡片/美术字约 (+2,+2)。
 
 ### 8.2 第二轮（修后重跑，同副本）
 
@@ -191,9 +192,9 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 |------|------|
 | 推断 | 65 条；约 21.9 秒（15:54:32–15:54:54；打开 2.5 s，条目 1.7 s，画板合成 17.7 s）。类型：image 23、nine_slice 16、dynamic_text 22、art_text 4。用导出 PNG 重测九宫格后：image 18、nine_slice 21、dynamic_text 22、art_text 4。 |
 | 预览 | 已重写标注预览。测试中将自动清单视为已确认。 |
-| 分类 | Daily 与 Total 均为 `art_text`（页签成对一致）。顶栏 Ranking 与底栏 Ranking 都是带效果的固定文案，各自为 `art_text`（角色不同，不必成对）。「007」为 `dynamic_text`（玩家名，不是名次）。分数、倒计时、名字、1–2 位名次均为 `dynamic_text`。 |
-| 导出 | 65/65 成功（43 张 PNG + 22 条仅属性的动态文字；新增 Total 与底栏 Ranking 的美术字）。墙钟约 42.1 秒（15:55:34–15:56:16），整图 5.3 秒。43 条光栅切图都记下了 `visible_bounds_from_trim_insets`（如金牌原点 1205,579 = 1200-(-5), 573-(-6)）。脚本打开副本后不保存关闭；`docs_before` / `docs_after` 均为空。日志里 `full_render.out_size` 仍可能是整布 9340×4036（crop 后 `doc.width` 不变），但 `saveAs.png` 写出的文件是当前画板 1080×2340。 |
-| 校验 | 漏切 / 重名 / 空图：0。约 10.4 秒（15:57:17–15:57:27）。用 Exo-Black / Exo-ExtraBold 渲染了全部 22 条动态文字。 |
+| 分类 | 成对页签文案均为 `art_text`。顶栏标题与导航标签都是带效果的固定文案，各自为 `art_text`（角色不同，不必成对）。带前导零的数字串为 `dynamic_text`（按名字，不是名次）。分数、倒计时、名字、1–2 位名次均为 `dynamic_text`。 |
+| 导出 | 65/65 成功（43 张 PNG + 22 条仅属性的动态文字；页签与导航上先前缺字的固定文案改为美术字出图）。墙钟约 42.1 秒（15:55:34–15:56:16），整图 5.3 秒。43 条光栅切图都记下了 `visible_bounds_from_trim_insets`。脚本打开副本后不保存关闭；`docs_before` / `docs_after` 均为空。日志里 `full_render.out_size` 仍可能是整份多画板画布的尺寸（crop 后 `doc.width` 不变），但 `saveAs.png` 写出的文件是当前画板 1080×2340。 |
+| 校验 | 漏切 / 重名 / 空图：0。约 10.4 秒（15:57:17–15:57:27）。用文档所用字体（`--fonts-dir`）渲染了全部 22 条动态文字。 |
 
 校验数字对比（同画板、同副本）：
 
@@ -207,13 +208,26 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 | ΔE>5 | 9.01% | 0.157% | 2.547% | 0.199% |
 | 像素差>16 | 10.893% | 0.147% | 2.527% | 0.190% |
 
-Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、名字、名次），来自 Pillow 无法复现 PS 的 hinting、字框锚点和外描边，不是切图错位。遮罩后残留的 >16 差像素共 3429 个（约占遮罩后像素的 0.15%），几乎都叠在底栏：`common_bg_navbar`、`common_btn_navtab_*`、末行列表底板、`common_icon_rank`。这是普通 src-over 不模拟 PS 混合模式造成的，属预期残差，不是漏切或原点错误。
+Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、名字、名次），来自 Pillow 无法复现 PS 的 hinting、字框锚点和外描边，不是切图错位。遮罩后残留的 >16 差像素共 3429 个（约占遮罩后像素的 0.15%），几乎都叠在底栏、导航按钮与末行列表底板等重叠层。这是普通 src-over 不模拟 PS 混合模式造成的，属预期残差，不是漏切或原点错误。
+
+### 8.3 规则文件外置后的回归（同副本）
+
+项目词表放在仓库外的 `--rules` JSON（不进技能仓库）。带规则完整重跑：推断 65 条（约 25.8 秒，16:11:01–16:11:28），类型与 8.2 相同（导出后 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4）；导出 65/65 成功、43 张 PNG（16:11:56–16:12:39，约 42.4 秒）；校验约 10.6 秒，漏切/重名/空图为 0。遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 8.2 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。`docs_before` / `docs_after` 为空。
+
+不传 `--rules` 时，对同一画板只跑推断也成功，且 **kind 完全一致**（同样 22 条动态文字、4 条美术字），说明分类核心不依赖项目词表。规范名则更泛化：画板名无法拉丁化时模块落在 `main`，奖牌/头像等缺少用途词，只能编成 `item1_3` 这类序号。举例（带规则 → 无规则）：
+
+- `rank_bg_item1_normal` → `main_bg_item1`
+- `rank_icon_medal_gold` → `main_bg_item1_3`
+- `rank_icon_avatar_item1` → `main_bg_item1_2`
+- `rank_img_daily_off` / `rank_img_total_on` → `main_img_name_off` / `main_img_name_on`
+- `rank_img_ranking`（标题或导航标签）→ `main_img_name`
+- 分数、倒计时、1–2 位名次、带前导零的名字等，无规则时仍能识别用途（`main_img_score_item1`、`main_img_timer`、`main_img_place_item4`、`main_img_name_item6`），只是模块变成 `main`。
 
 **一并核实的 API / 行为：**
 
 - `boundsNoEffects` 确是不含效果的逻辑框。同次 `get` 还可能出现 `bounds`、`boundsNoMask`，部分层有 `pathBounds` 或 `boundingBox`。不要把 `bounds` 直接当成「含效果可见框」。
 - DOM `layer.bounds` 在「从图层新建」的栅格副本上往往比 trim 更松；trim 后 left/top 是内缩量，可见原点用 `before - after`。
-- 对多画板文档做「从图层新建」时，新文档可能仍是整份画布；`saveAs.png` 有时会按当前画板写出 1080×2340 的文件，但 `doc.width` 仍是整布尺寸。模板会尝试按 `artboard.bounds` 裁切；校验以实际 PNG 尺寸为准。
+- 对多画板文档做「从图层新建」时，新文档可能仍是整份画布；`saveAs.png` 有时会按当前画板写出目标尺寸的文件，但 `doc.width` 仍是整布尺寸。模板会尝试按 `artboard.bounds` 裁切；校验以实际 PNG 尺寸为准。
 - 16 位文档导出前需转 8 位（trim 前就转，使内缩量与导出 PNG 一致）。
-- `psd-tools` 1.26 默认 `max_objects=1_000_000`，这份 PSB 会超限；渐变九宫格分析需要 scipy。
+- `psd-tools` 1.26 默认 `max_objects=1_000_000`，大 PSB 会超限；渐变九宫格分析需要 scipy。
 - 校验拼图用 `Image.alpha_composite`（src-over）。`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。
