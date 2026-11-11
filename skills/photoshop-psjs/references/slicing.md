@@ -2,6 +2,19 @@
 
 助手只准备材料；跑这个 skill 的 **agent**（大模型）阅读材料后编写 manifest（组件、部件、状态、规范名）。用户改 JSON 确认后，再由 `.psjs` 按 `layer_id` 导出 1x PNG，写出引擎无关的布局 JSON，并校验默认状态拼图。启动、守卫、`silent` 等规则见 [SKILL.md](../SKILL.md)。模板：[examples/export_slices.psjs](../examples/export_slices.psjs)、[examples/slicing_helper.py](../examples/slicing_helper.py)。
 
+## 决策树
+
+按这个顺序做，**确认前不要导出**。
+
+1. **打开材料。** 先看 `full_render_preview.png`（若已有 Photoshop 导出的 `full_render.png`，以它为准），再对照 `crops_sheet.jpg` 和 `crops/<layer_id>.png`。用 `crops_index.json` 把 id 对回 `tree.json`（可见性、路径、文本、效果）。不要猜测 id，也不要去读不存在的裁切图。
+2. **识别组件。** 把页签组、底栏、按钮、列表行等交互控件收成组件，按槽位拆开，不要按 PSD 分组原样切开。
+3. **分清共用零件和随状态变化的零件。** 图标、始终存在的底等跨状态不变的，放进该组件的 `shared`，文件名不加状态后缀。槽/底的明暗、选中高亮、只在某一态出现的标签等，放进 `states.<state>.parts`。
+4. **区分状态变体和旧稿。** 主体/内容不变、只改明度、描边、发光、配色或缩放的，是状态变体，可以导出。同一槽位但换了内容或徽记的，当旧稿忽略。内容或母题对不上、吃不准时才写 `uncertain_hidden`，并附上两侧裁切图。
+5. **只给会随状态变化的零件记 missing。** 以同组里状态最完整的那一项为模板（例如某选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，**包括 highlight**。不要因为共用图标没有另一态就标 missing。单个特殊样式的列表行（例如 self 高亮行）只是这一行的一个实例：不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。
+6. **写好审核清单后停下。** 跑 `flatten` + `preview`，`status` 保持 `pending_review`，等用户改 JSON 确认后再导出。
+
+选中槽上的隐藏层：若它落在**当前选中项**的槽里，并且是同一主体、只是加了发光或高亮样式，应作为该态的 `highlight`。若默认态就是这一项被选中，即使该高亮层在 PSD 里仍是隐藏的，也要纳入默认选中态，否则拼图会缺一层。只有内容或徽记对不上时，才用 `uncertain_hidden`。
+
 助手子命令：
 
 ```text
@@ -16,7 +29,34 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 
 `--artboard` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。`--rules` 只是给 agent 看的项目命名约定，不再作为自动分类的主路径。
 
-依赖：`psd-tools`、Pillow、numpy。预览合成与九宫格分析还需要 `scipy`（`pip install scipy` 或 `psd-tools[composite]`）。大 PSD/PSB 打开时把 `ParseLimits.max_objects` 设为 `None`，否则默认 1,000,000 会直接失败（实测）。
+### Python 环境
+
+优先使用**项目虚拟环境**，不要把包装进系统 Python。系统解释器里没有依赖时，不要对系统 Python 执行 `pip install`。
+
+```text
+python3 -m venv .venv
+# Windows：.venv\Scripts\activate    POSIX：source .venv/bin/activate
+pip install "psd-tools[composite]" pillow numpy
+# 之后一律用该环境的解释器调用助手，例如：
+#   .venv\Scripts\python.exe examples/slicing_helper.py prepare ...
+#   .venv/bin/python examples/slicing_helper.py prepare ...
+```
+
+若工作区附近已有装好这些包的 venv，直接用它的 `python`，不必再装一份。需要的包：`psd-tools`、Pillow、numpy；预览合成与九宫格分析还要 `scipy`（已包含在 `psd-tools[composite]` 里）。
+
+打开 PSD/PSB 时传入 `ParseLimits`。已在 **psd-tools 1.26.1** 核实的签名是：
+
+```python
+from psd_tools import PSDImage
+from psd_tools.psd.parse_limits import ParseLimits  # 也可 from psd_tools import ParseLimits
+
+# ParseLimits(max_read_bytes=None, max_total_bytes=None, max_objects=1_000_000, max_nesting_depth=64)
+# max_objects 默认为 1_000_000；大文档会触发 ParseLimitError。传入 None 可关闭这一上限。
+# 不要写 ParseLimits.max_objects = None（那不是正确用法）。
+PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))
+```
+
+助手的 `open_psd()` 已经这样调用。不要猜参数名，也不要对系统 Python 安装依赖。
 
 ---
 
@@ -44,13 +84,15 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 |------|------|
 | `full_render_preview.png` | 画板**当前可见/默认状态**的合成（psd-tools，部分图层效果可能缺失）。若已有 Photoshop 导出的 `full_render.png`，审核和校验以 PS 整图为准。 |
 | `tree.json` | 图层树：`name`、`path`、`kind`、文本内容、效果摘要、`visible`（含隐藏层）、`bbox`、`layer_id`。 |
-| `crops/<layer_id>.png` | 可导出叶子（及剪贴单元）的裁切图，文件名就是 `layer_id`。隐藏层只要与画板相交且有像素也会出图。 |
-| `crops_index.json` | 每张裁切图的 id、可见性、路径、文本、效果、九宫格候选、`select_ids`。 |
+| `crops/<layer_id>.png` | **仅**可导出叶子（及剪贴单元）的裁切图，文件名就是 `layer_id`。隐藏层只要与画板相交且有像素也会出图。组、空层、不相交或合成后无像素的层**不会**出图。 |
+| `crops_index.json` | 每张**实际写出的**裁切图的 id、可见性、路径、文本、效果、九宫格候选、`select_ids`。查 id 用这份索引，不要猜文件名。 |
 | `crops_sheet.jpg` | 所有裁切图的拼图，隐藏项标 `HID`，便于快速扫。 |
 | `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
 | `materials.json` | 上述路径和数量统计。 |
 
-阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `tree.json` 把裁切图的 id 对回图层路径、可见性和文本。不要只根据图层名做决定，名称经常不准。
+阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `crops_index.json` 把 id 对回 `tree.json` 的路径、可见性和文本。不要只根据图层名做决定，名称经常不准。
+
+`crops/` 里不是树上每一个 `layer_id` 都有文件。查某个候选 id 时，先在 `crops_index.json`（或 `crops_sheet.jpg` 上的 id）里找，不要直接拼 `crops/<id>.png` 去猜。若索引里没有这个 id：不要反复尝试打开不存在的文件，也不要把它当成「缺了一态」。回到 `tree.json` 看该节点——若是组，改用其中有裁切图的叶子；若是空层、在画板外、或合成后没有像素，跳过并在 notes 里说明。没有裁切图本身不能证明存在或缺失某个状态。
 
 ---
 
@@ -75,7 +117,11 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
    - **旧版或备选稿**：同一位置的隐藏层换了内容或换了母题（例如换了一枚不同的徽记，或数字与符号不是同一套图形），应忽略，不要导出，也不要用它去填某一态。若该零件本身是跨状态共用的，把已经在用的那份真资源放进 `shared`，**不要**因为忽略了旧稿就把图标写成 missing。
    - **吃不准**：不要擅自选边。在审核清单里写 `uncertain_hidden`，带上两边的 `layer_id` 和裁切图路径，让用户决定。
    隐藏层若与任何已识别组件的状态无关，同样忽略。
-4. **只有按设计会随状态变化的部件，找不到合格变体时，才记 missing。** 例如这个控件的底/高亮在已有成对状态里是会变的，但某个项没有画出 selected 底或高亮，就在 `missing` 里写 `{ "state": "selected", "role": "base", "reason": "..." }`，等用户确认要不要补。跨状态不变的零件即使只有一份，也不是缺失，不要写「没有另一态的图标」。禁止捏造未画出的变体。
+
+   落在**当前选中项槽位**上的隐藏层：若主体/内容与该项正在使用的资源相同，只是加了发光、描边或高亮样式，应作为该选中态的 `highlight`（不要只用 `uncertain_hidden` 挂起）。若默认态就是这一项被选中，即便该层在 PSD 里仍隐藏，也要纳入默认选中态，否则校验拼图会少一层。只有内容或徽记明显不同、无法判断是高亮还是旧稿时，才写 `uncertain_hidden`。
+4. **只有按设计会随状态变化的部件，找不到合格变体时，才记 missing。** 先看同组里哪一项的某一态最完整（零件最多），用它的角色集合当模板。例如某个选中项有 base + highlight + label，则每个缺少其中一件的兄弟项都要在 `missing` 里列出对应 `{ "state": "selected", "role": "..." }`，**包括 highlight**，等用户确认要不要补。跨状态不变的零件即使只有一份，也不是缺失，不要写「没有另一态的图标」。禁止捏造未画出的变体。
+
+   单个特殊样式的列表行（例如只有一行画了 self 高亮）只是**这一行的一个实例**，不是「每一行都该有 self / 这一行还缺 normal」。不要给其它行推断缺失的 self，也不要给这一行推断缺失的 normal，除非设计里每行都画出了成套状态变体。
 5. 底图、高亮、图标、文字始终是独立 `parts`。类型仍是 `image` | `nine_slice` | `dynamic_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）；带效果的固定标签（页签名、导航名、标题）用 `art_text`（出图）。
 6. 列表重复行各导一份，不去重。全部 1x。
 
@@ -87,12 +133,12 @@ python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画�
 
 | 段 | 含义 | 例子 |
 |----|------|------|
-| 模块 | 功能模块或画板的拉丁/拼音缩写 | `main`、`shop`、`common` |
+| 模块 | 功能模块或画板的拉丁/拼音缩写 | `main`、`<module>`、`common` |
 | 类型 | 资源种类 | `bg`、`btn`、`icon`、`img`、`tab` |
-| 用途 | 这个零件干什么 | `highlight`、`title`、`home`、`avatar`、`item3` |
+| 用途 | 这个零件干什么 | `highlight`、`title`、`item_a`、`avatar`、`item3` |
 | 状态 | 只给随状态变化的零件加这一段；跨状态共用的零件不加 | `normal`、`selected`、`on`、`off` |
 
-同一组件下，不同状态的同一零件应共用前三段、只改状态段，例如 `main_tab_left_normal` 与 `main_tab_left_selected`。跨状态不变的零件去掉状态段，例如 `common_icon_home`，不要写成 `common_icon_home_selected`。可选的 `--rules` / [naming_rules.example.json](../examples/naming_rules.example.json) 只提供项目用词习惯（模块词、固定标签等），供 agent 参考，不是自动分类器。
+同一组件下，不同状态的同一零件应共用前三段、只改状态段，例如 `main_tab_left_normal` 与 `main_tab_left_selected`。跨状态不变的零件去掉状态段，例如 `common_icon_item_a`，不要写成 `common_icon_item_a_selected`。可选的 `--rules` / [naming_rules.example.json](../examples/naming_rules.example.json) 只提供项目用词习惯（模块词、固定标签等），供 agent 参考，不是自动分类器。
 
 ---
 
@@ -138,7 +184,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
 
 ### 5.1 示例：双页签开关 + 底栏导航
 
-下面是一份**虚构**界面，不要把它当成某个项目的图层名。屏幕当前显示：左侧页签选中、底栏第一项选中。隐藏层里有右侧页签的选中文案、左侧页签的未选中文案，以及第一项的未选中底。右侧页签没有单独的未选中高亮（高亮是 group 上的共享资源）。导航图标在两种状态下不变，放在各 `nav_item` 的 `shared` 里。第二项没有画出 selected 底或高亮，只把这两项记入 `missing`，不要把共用图标标成缺失。
+下面是一份**虚构**界面，不要把它当成某个项目的图层名。屏幕当前显示：左侧页签选中、底栏第一项选中。隐藏层里有右侧页签的选中文案、左侧页签的未选中文案，以及第一项的未选中底。右侧页签没有单独的未选中高亮（高亮是 group 上的共享资源）。导航图标在两种状态下不变，放在各 `nav_item` 的 `shared` 里。以第一项的 selected（base + highlight + label）为模板，第二项缺少的 selected 底、高亮和标签都记入 `missing`，不要把共用图标标成缺失。
 
 ```json
 {
@@ -244,7 +290,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
           "id": "main_navbar",
           "type": "navbar",
           "name": "main_navbar",
-          "default_state": "home",
+          "default_state": "item_a",
           "shared": [
             {
               "name": "main_bg_navbar",
@@ -257,13 +303,13 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
           ],
           "children": [
             {
-              "id": "main_nav_home",
+              "id": "main_nav_item_a",
               "type": "nav_item",
-              "name": "main_nav_home",
+              "name": "main_nav_item_a",
               "default_state": "selected",
               "shared": [
                 {
-                  "name": "main_icon_home",
+                  "name": "main_icon_item_a",
                   "role": "icon",
                   "kind": "image",
                   "layer_id": 311,
@@ -275,18 +321,25 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                   "from_hidden": false,
                   "parts": [
                     {
-                      "name": "main_bg_nav_home_selected",
+                      "name": "main_bg_nav_item_a_selected",
                       "role": "base",
                       "kind": "nine_slice",
                       "layer_id": 310,
                       "hidden": false
                     },
                     {
-                      "name": "main_img_home_selected",
+                      "name": "main_img_item_a_selected",
                       "role": "text",
                       "kind": "art_text",
                       "layer_id": 312,
                       "hidden": false
+                    },
+                    {
+                      "name": "main_nav_item_a_highlight_selected",
+                      "role": "highlight",
+                      "kind": "nine_slice",
+                      "layer_id": 314,
+                      "hidden": true
                     }
                   ]
                 },
@@ -294,7 +347,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                   "from_hidden": true,
                   "parts": [
                     {
-                      "name": "main_bg_nav_home_normal",
+                      "name": "main_bg_nav_item_a_normal",
                       "role": "base",
                       "kind": "nine_slice",
                       "layer_id": 313,
@@ -306,13 +359,13 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
               "missing": []
             },
             {
-              "id": "main_nav_shop",
+              "id": "main_nav_item_b",
               "type": "nav_item",
-              "name": "main_nav_shop",
+              "name": "main_nav_item_b",
               "default_state": "normal",
               "shared": [
                 {
-                  "name": "main_icon_shop",
+                  "name": "main_icon_item_b",
                   "role": "icon",
                   "kind": "image",
                   "layer_id": 321,
@@ -324,7 +377,7 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                   "from_hidden": false,
                   "parts": [
                     {
-                      "name": "main_bg_nav_shop_normal",
+                      "name": "main_bg_nav_item_b_normal",
                       "role": "base",
                       "kind": "image",
                       "layer_id": 322,
@@ -337,7 +390,17 @@ Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `ent
                 {
                   "state": "selected",
                   "role": "base",
-                  "reason": "Slot and highlight change between states in this bar, but no selected base or highlight is drawn for this item."
+                  "reason": "The most complete selected sibling has base + highlight + label; this item has no selected base drawn."
+                },
+                {
+                  "state": "selected",
+                  "role": "highlight",
+                  "reason": "The most complete selected sibling has a highlight; this item has none drawn."
+                },
+                {
+                  "state": "selected",
+                  "role": "text",
+                  "reason": "The most complete selected sibling has a label; this item has none drawn."
                 }
               ]
             }
@@ -454,13 +517,13 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 
 项目词表放在仓库外的 `--rules` JSON（不进技能仓库）。带规则完整重跑：推断 65 条（约 25.8 秒，16:11:01–16:11:28），类型与 8.2 相同（导出后 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4）；导出 65/65 成功、43 张 PNG（16:11:56–16:12:39，约 42.4 秒）；校验约 10.6 秒，漏切/重名/空图为 0。遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 10.2 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。`docs_before` / `docs_after` 为空。
 
-不传 `--rules` 时，对同一画板只跑推断也成功，且 **kind 完全一致**（同样 22 条动态文字、4 条美术字），说明分类核心不依赖项目词表。规范名则更泛化：画板名无法拉丁化时模块落在 `main`，奖牌/头像等缺少用途词，只能编成 `item1_3` 这类序号。举例（带规则 → 无规则）：
+不传 `--rules` 时，对同一画板只跑推断也成功，且 **kind 完全一致**（同样 22 条动态文字、4 条美术字），说明分类核心不依赖项目词表。规范名则更泛化：画板名无法拉丁化时模块落在 `main`，徽章/头像等缺少用途词，只能编成 `item1_3` 这类序号。举例（带规则 → 无规则）：
 
-- `rank_bg_item1_normal` → `main_bg_item1`
-- `rank_icon_medal_gold` → `main_bg_item1_3`
-- `rank_icon_avatar_item1` → `main_bg_item1_2`
-- `rank_img_daily_off` / `rank_img_total_on` → `main_img_name_off` / `main_img_name_on`
-- `rank_img_ranking`（标题或导航标签）→ `main_img_name`
+- `<module>_bg_item1_normal` → `main_bg_item1`
+- `<module>_icon_badge_1` → `main_bg_item1_3`
+- `<module>_icon_avatar_item1` → `main_bg_item1_2`
+- `<module>_img_tab_off` / `<module>_img_tab_on` → `main_img_name_off` / `main_img_name_on`
+- `<module>_img_title`（标题或导航标签）→ `main_img_name`
 - 分数、倒计时、1–2 位名次、带前导零的名字等，无规则时仍能识别用途（`main_img_score_item1`、`main_img_timer`、`main_img_place_item4`、`main_img_name_item6`），只是模块变成 `main`。
 
 **一并核实的 API / 行为：**

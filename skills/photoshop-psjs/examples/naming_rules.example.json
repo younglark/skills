@@ -158,6 +158,7 @@
     "title"
   ],
   "value_name_keywords": [
-    "player name"
+    "username",
+    "nickname"
   ]
 }

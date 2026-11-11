@@ -214,15 +214,17 @@ await out.write(JSON.stringify(log, null, 2));
 
 ## 9. Agent 切图工作流
 
-把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
+把界面切成游戏引擎可导入的 1x PNG，并产出一份按组件语义组织、引擎无关的中间布局 JSON。细节、schema、命名、识别方法和实测见 [references/slicing.md](references/slicing.md)。**先按该文文首的决策树走：** 打开材料 → 识别组件 → 分清共用与随状态变化的零件 → 区分变体与旧稿 → 只给会变的零件记 missing → 停在审核门闩。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)、[examples/naming_rules.example.json](examples/naming_rules.example.json)、[examples/export_config.example.json](examples/export_config.example.json)。
+
+**Python 环境：** 用项目 venv 运行助手，不要把包装进系统 Python。需要 `psd-tools[composite]`、Pillow、numpy。打开大文档用已核实的 `PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))`（不要猜参数，也不要设置 `ParseLimits.max_objects` 类属性）。详见 slicing.md「Python 环境」。
 
 **分工：** 助手只准备材料（默认状态整图、带 id 的逐层裁切图、含隐藏层的图层树、九宫格候选）。跑这个 skill 的 agent 同时阅读这些材料，编写 manifest：组件、部件、规范名、类型、状态和层级。`--rules` 只是可选的项目命名约定。`infer` 仍可产出关键词草稿（`draft_manifest.json`），但不能代替 agent 的清单。
 
 **流程（确认前不导出）：**
 
-1. **准备材料（离线）**：`prepare`。`--artboard <画板名或id>` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。树里包含隐藏层（`visible` 标记）。裁切图文件名是 `layer_id`。
-2. **Agent 编写 manifest**：识别页签、底栏、按钮、列表行等交互组件，把底/高亮/图标/文字按状态拆成独立部件，不要把状态烘焙在一起。先看设计里哪些零件跨状态共用、哪些会变：共用的放进 `shared`（文件名不加状态后缀），会变的放进各 `states`。隐藏层只有在主体/内容不变、差别只是状态样式（明度、描边、发光、配色等）时才算交替状态；同一位置但换了内容或徽记的，当作旧稿/备选稿忽略，不要用它去顶替共用的真资源，也不要把共用零件写成 missing。只有按设计会随状态变化却没画出来的部件才写入 `missing` 并说明原因，禁止捏造。吃不准时写 `uncertain_hidden`（带上两侧裁切图），不要擅自选边。命名为 `模块_类型_用途_状态`（小写；共用零件省略状态段），不要直接用 PSD 图层名。类型：`image` | `nine_slice` | `dynamic_text` | `art_text`。
-3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。
+1. **准备材料（离线）**：`prepare`。`--artboard <画板名或id>` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。树里包含隐藏层（`visible` 标记）。`crops/` 只包含可导出叶子；用 `crops_index.json` 查 id，不要猜文件名。索引里没有的 id，回到 `tree.json` 看它是组、空层还是在画板外，不要当成缺失的状态。
+2. **Agent 编写 manifest**：识别页签组、底栏、按钮、列表行等交互组件，把底/高亮/图标/文字按状态拆成独立部件，不要把状态烘焙在一起。先看设计里哪些零件跨状态共用、哪些会变：共用的放进 `shared`（文件名不加状态后缀），会变的放进各 `states`。隐藏层只有在主体/内容不变、差别只是状态样式（明度、描边、发光、配色等）时才算交替状态；同一槽位但换了内容或徽记的，当作旧稿忽略，不要用它去顶替共用的真资源，也不要把共用零件写成 missing。落在当前选中项槽里、同一主体且只是发光/高亮样式的隐藏层，应作为该态的 `highlight`（默认选中态也要纳入）；只有内容或母题对不上时才写 `uncertain_hidden`（带上两侧裁切图）。missing 以同组里最完整的那一项为模板（例如选中项有 base + highlight + label），每个缺少其中一件的兄弟项都要列出，包括 highlight。单个特殊样式的列表行只是该行的一个实例，不要给其它行推断缺失状态，也不要给这一行推断缺失的 normal，除非设计里每行都有成套变体。禁止捏造。命名为 `模块_类型_用途_状态`（小写；共用零件省略状态段），不要直接用 PSD 图层名。类型：`image` | `nine_slice` | `dynamic_text` | `art_text`。
+3. **审核门闩**：`flatten` + `preview` 产出标注预览和 JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。`preview` 会跳过倒置或空的包围盒并给出警告，不要因此中断。
 4. **导出（`.psjs`）**：脚本只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径。按 `layer_id` 导出 1x PNG，效果烘焙进图；重复实例各导一份。`dynamic_text` 不出图，只导出文本属性；`art_text` 出图。隐藏状态层会临时显示再恢复，文档不保存。
 5. **布局 JSON**：按组件语义组织（如 `screen > tab_group > tab > state > part`），源图层 id/路径仅供对照。记录可见尺寸（含效果）、逻辑尺寸（不含效果）、锚点、九宫格、文本属性和图片。各引擎导入器自己写。
 6. **校验**：只把**默认状态**按 src-over 拼回去，和 PS 整图比像素差 / CIEDE2000 ΔE（含 Pillow 动态文字版与遮罩版，并列误差最大的 10 条）。再为每个交替状态写出预览图供目视检查。同时检查漏切、重名、空图。

@@ -2,7 +2,12 @@
 # -*- coding: utf-8 -*-
 """Agent slicing helper: infer a manifest, annotate a preview, build layout JSON, validate.
 
-Requires: psd-tools, Pillow, numpy
+Requires: psd-tools, Pillow, numpy, and scipy (or psd-tools[composite]) for
+preview compositing and nine-slice analysis. Prefer a project virtualenv; do
+not install packages into the system Python. Open large documents with
+``PSDImage.open(path, parse_limits=ParseLimits(max_objects=None))``
+(psd-tools 1.26+: ``ParseLimits.max_objects`` defaults to 1_000_000; ``None``
+disables that cap). See references/slicing.md.
 
 Subcommands:
   prepare     Build agent materials: full-render preview, per-layer crops, layer tree, nine-slice candidates.
@@ -76,6 +81,51 @@ def slugify(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     return s.strip("_")
+
+
+def warn(msg: str) -> None:
+    print(f"warning: {msg}", file=sys.stderr, flush=True)
+
+
+def normalize_box(x0, y0, x1, y1, *, width=None, height=None, name=None):
+    """Return (left, top, right, bottom) with right >= left and bottom >= top.
+
+    Inverted edges are swapped. If *width* / *height* are given, the box is
+    clamped to ``[0, width-1]`` x ``[0, height-1]``. Empty or non-numeric
+    boxes return None and emit a warning (they must not be drawn).
+    """
+    try:
+        a = float(x0)
+        b = float(y0)
+        c = float(x1)
+        d = float(y1)
+    except (TypeError, ValueError):
+        warn(f"skipping non-numeric bounds {x0!r},{y0!r},{x1!r},{y1!r}" + (f" ({name})" if name else ""))
+        return None
+    if c < a:
+        a, c = c, a
+    if d < b:
+        b, d = d, b
+    if width is not None:
+        max_x = max(0, int(width) - 1)
+        a = min(max(0.0, a), float(max_x))
+        c = min(max(0.0, c), float(max_x))
+        if c < a:
+            a, c = c, a
+    if height is not None:
+        max_y = max(0, int(height) - 1)
+        b = min(max(0.0, b), float(max_y))
+        d = min(max(0.0, d), float(max_y))
+        if d < b:
+            b, d = d, b
+    if c - a < 1 or d - b < 1:
+        warn(
+            "skipping empty or inverted bounds "
+            f"[{x0}, {y0}, {x1}, {y1}] -> [{a}, {b}, {c}, {d}]"
+            + (f" ({name})" if name else "")
+        )
+        return None
+    return (a, b, c, d)
 
 
 def find_token(text: str, pairs):
@@ -236,7 +286,7 @@ DEFAULT_RULES = {
     "list_item_pattern": r"/list\s*(\d+)(?:/|$)",
     "self_row_keywords": ["self"],
     "art_text_name_keywords": ["title"],
-    "value_name_keywords": ["player name"],
+    "value_name_keywords": ["username", "nickname"],
 }
 
 
@@ -579,7 +629,7 @@ def infer_type_purpose_state(node, module: str, rules: NamingRules):
             typ = "bg"
         elif purpose in {"hline", "vline", "divider"}:
             typ = "deco"
-        elif purpose and purpose.split("_")[0] in {"avatar", "medal", "icon"}:
+        elif purpose and purpose.split("_")[0] in {"avatar", "badge", "icon"}:
             typ = "icon"
         elif (node.get("width") or 0) >= 200 and (node.get("height") or 0) >= 80:
             typ = "bg"
@@ -1014,17 +1064,30 @@ def annotate_preview(base: Image.Image, entries, art_origin, out_path: Path, tit
     font_sm = load_font(13)
     for entry in entries:
         bbox = entry.get("logical_bounds") or [0, 0, 0, 0]
-        l, t, r, b = bbox
+        if len(bbox) < 4:
+            warn(f"skipping entry with incomplete bounds: {entry.get('name')}")
+            continue
+        l, t, r, b = bbox[0], bbox[1], bbox[2], bbox[3]
         l, t, r, b = l - ox, t - oy, r - ox, b - oy
+        box = normalize_box(l, t, r, b, width=overlay.width, height=overlay.height, name=entry.get("name"))
+        if box is None:
+            continue
+        l, t, r, b = box
+        # Pillow rectangles are inclusive; keep the far edge inside the box.
+        r_draw, b_draw = max(l, r - 1), max(t, b - 1)
         color = KIND_COLORS.get(entry["kind"], (255, 255, 255))
-        draw.rectangle([l, t, r - 1, b - 1], outline=color + (255,), width=2)
+        draw.rectangle([l, t, r_draw, b_draw], outline=color + (255,), width=2)
         nine = entry.get("nine_slice")
         if nine and entry["kind"] == "nine_slice":
             guide = (255, 220, 80, 220)
-            draw.line([(l + nine["left"], t), (l + nine["left"], b - 1)], fill=guide, width=1)
-            draw.line([(r - 1 - nine["right"], t), (r - 1 - nine["right"], b - 1)], fill=guide, width=1)
-            draw.line([(l, t + nine["top"]), (r - 1, t + nine["top"])], fill=guide, width=1)
-            draw.line([(l, b - 1 - nine["bottom"]), (r - 1, b - 1 - nine["bottom"])], fill=guide, width=1)
+            left_g = min(max(l, l + nine["left"]), r_draw)
+            right_g = min(max(l, r_draw - nine["right"]), r_draw)
+            top_g = min(max(t, t + nine["top"]), b_draw)
+            bot_g = min(max(t, b_draw - nine["bottom"]), b_draw)
+            draw.line([(left_g, t), (left_g, b_draw)], fill=guide, width=1)
+            draw.line([(right_g, t), (right_g, b_draw)], fill=guide, width=1)
+            draw.line([(l, top_g), (r_draw, top_g)], fill=guide, width=1)
+            draw.line([(l, bot_g), (r_draw, bot_g)], fill=guide, width=1)
         label = f"{entry['name']}  [{entry['kind']}]"
         # Place the label above the box if there is room, else inside.
         ty = t - 16 if t >= 18 else t + 2
@@ -1034,8 +1097,11 @@ def annotate_preview(base: Image.Image, entries, art_origin, out_path: Path, tit
             tw = draw.textlength(label, font=font_sm)
         except Exception:
             tw = 8 * len(label)
-        draw.rectangle([tx, ty, tx + tw + 6, ty + 16], fill=(0, 0, 0, 160))
-        draw.text((tx + 3, ty + 1), label, fill=color + (255,), font=font_sm)
+        lab = normalize_box(tx, ty, tx + tw + 6, ty + 16, width=overlay.width, height=overlay.height, name=entry.get("name"))
+        if lab is not None:
+            lx0, ly0, lx1, ly1 = lab
+            draw.rectangle([lx0, ly0, lx1, ly1], fill=(0, 0, 0, 160))
+            draw.text((lx0 + 3, ly0 + 1), label, fill=color + (255,), font=font_sm)
     out = Image.alpha_composite(canvas, overlay).convert("RGB")
     # Legend bar at the top
     legend = Image.new("RGB", (out.width, 36), (20, 20, 20))
@@ -1167,7 +1233,7 @@ def write_crop_sheet(items, out_path, thumb=160, cols=8):
 
 def open_psd(psd_path, warnings=None):
     if PSDImage is None:
-        raise SystemExit("psd-tools is required (pip install psd-tools)")
+        raise SystemExit("psd-tools is required. Install it in a project venv (not system Python); see references/slicing.md.")
     psd_path = Path(psd_path)
     open_kwargs = {}
     if ParseLimits is not None:
@@ -1533,7 +1599,7 @@ def cmd_flatten(args):
 
 def cmd_infer(args):
     if PSDImage is None:
-        raise SystemExit("psd-tools is required for infer (pip install psd-tools)")
+        raise SystemExit("psd-tools is required for infer. Install it in a project venv (not system Python); see references/slicing.md.")
     t0 = time.time()
     psd_path = Path(args.psd)
     out_dir = Path(args.out_dir)
@@ -2408,12 +2474,15 @@ def annotate_missing_state(image, markers):
         b = marker.get("bounds")
         label = marker.get("label") or "missing"
         if b:
-            l, top, r, bt = [int(round(b[k])) for k in ("left", "top", "right", "bottom")]
-            l, top = max(0, l), max(0, top)
-            r, bt = min(image.width - 1, r), min(image.height - 1, bt)
-            if r > l and bt > top:
+            raw = [b.get(k) for k in ("left", "top", "right", "bottom")]
+            box = normalize_box(*raw, width=image.width, height=image.height, name=label)
+            if box is not None:
+                l, top, r, bt = [int(round(v)) for v in box]
                 for w in range(4):
-                    draw.rectangle([l + w, top + w, r - w, bt - w], outline=(220, 30, 30))
+                    inner = normalize_box(l + w, top + w, r - w, bt - w, width=image.width, height=image.height)
+                    if inner is None:
+                        break
+                    draw.rectangle([inner[0], inner[1], inner[2], inner[3]], outline=(220, 30, 30))
                 tx, ty = l, max(0, top - 28)
             else:
                 tx, ty = 8, 8
@@ -2423,8 +2492,11 @@ def annotate_missing_state(image, markers):
             tw = draw.textlength(label, font=font)
         except Exception:
             tw = 10 * len(label)
-        draw.rectangle([tx, ty, tx + int(tw) + 12, ty + 26], fill=(220, 30, 30))
-        draw.text((tx + 6, ty + 2), label, fill=(255, 255, 255), font=font)
+        lab = normalize_box(tx, ty, tx + int(tw) + 12, ty + 26, width=image.width, height=image.height, name=label)
+        if lab is not None:
+            lx0, ly0, lx1, ly1 = lab
+            draw.rectangle([lx0, ly0, lx1, ly1], fill=(220, 30, 30))
+            draw.text((lx0 + 6, ly0 + 2), label, fill=(255, 255, 255), font=font)
     return image
 
 
