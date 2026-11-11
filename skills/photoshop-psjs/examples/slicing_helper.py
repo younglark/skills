@@ -1374,10 +1374,23 @@ def cmd_prepare(args):
     return 0
 
 
+def component_shared_parts(component):
+    """Invariant parts: shared, common_parts, and parts (synonyms). State is omitted."""
+    out, seen = [], set()
+    for key in ("shared", "common_parts", "parts"):
+        for part in component.get(key) or []:
+            ident = part.get("name") or (id(part),)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out.append(part)
+    return out
+
+
 def iter_component_parts(component, ancestors=None):
     """Yield (component, state_name or None, state_obj or None, part) for every part."""
     ancestors = ancestors or []
-    for part in component.get("parts") or []:
+    for part in component_shared_parts(component):
         yield component, None, None, part
     states = component.get("states") or {}
     if isinstance(states, dict):
@@ -1721,8 +1734,11 @@ def enrich_components(components, nodes_by_name):
         return out
 
     def enrich(comp):
-        out = {k: v for k, v in comp.items() if k not in {"parts", "states", "children"}}
-        out["parts"] = [enrich_part(part) for part in (comp.get("parts") or [])]
+        out = {k: v for k, v in comp.items() if k not in {"parts", "shared", "common_parts", "states", "children"}}
+        shared = [enrich_part(part) for part in component_shared_parts(comp)]
+        out["shared"] = shared
+        out["parts"] = shared
+        out["common_parts"] = shared
         states = comp.get("states") or {}
         if isinstance(states, dict):
             out["states"] = {}
@@ -2279,7 +2295,12 @@ def collect_alternate_activations(layout):
                 or parent.get("type") in {"tab_group", "navbar", "nav_bar", "segmented"}
             )
         )
-        for state_name in states:
+        state_names = list(states.keys())
+        for item in comp.get("missing") or []:
+            name = item if isinstance(item, str) else (item or {}).get("state")
+            if name and name not in state_names:
+                state_names.append(name)
+        for state_name in state_names:
             if default is not None and state_name == default:
                 continue
             activation = {comp.get("id"): state_name}
@@ -2297,40 +2318,113 @@ def collect_alternate_activations(layout):
                 "component_type": comp.get("type"),
                 "state": state_name,
                 "activation": activation,
-                "from_hidden": bool((states.get(state_name) or {}).get("from_hidden")),
+                "from_hidden": bool((states.get(state_name) or {}).get("from_hidden")) if state_name in states else False,
             })
     return previews
 
 
 
-def missing_labels_for_state(layout, component_id, state_name):
-    labels = []
+def _bounds_dict(b):
+    if not b:
+        return None
+    if isinstance(b, dict) and "left" in b:
+        return {k: float(b[k]) for k in ("left", "top", "right", "bottom")}
+    if isinstance(b, (list, tuple)) and len(b) == 4:
+        return {"left": float(b[0]), "top": float(b[1]), "right": float(b[2]), "bottom": float(b[3])}
+    return None
+
+
+def component_slot_bounds(layout, component_id):
+    """Best-effort box for a missing state-dependent part: the item's base/highlight."""
+    preferred, fallback = None, None
+    for node in layout.get("nodes") or []:
+        if node.get("component_id") != component_id:
+            continue
+        b = _bounds_dict(node.get("visible_bounds") or node.get("logical_bounds"))
+        if not b:
+            continue
+        if node.get("part_role") in {"base", "highlight"}:
+            preferred = b
+            break
+        if fallback is None:
+            fallback = b
+    return preferred or fallback
+
+
+def missing_markers_for_state(layout, component_id, state_name):
+    """Red-box markers only for state-dependent parts that are truly missing."""
+    markers = []
+    slot = component_slot_bounds(layout, component_id)
     for comp in iter_layout_components(layout.get("components") or []):
         if comp.get("id") != component_id:
             continue
         for item in comp.get("missing") or []:
-            if isinstance(item, str) and item == state_name:
-                labels.append(f"missing: {state_name}")
+            if isinstance(item, str):
+                if item != state_name:
+                    continue
+                markers.append({
+                    "label": "missing",
+                    "state": state_name,
+                    "role": None,
+                    "bounds": slot,
+                })
             elif isinstance(item, dict) and item.get("state") == state_name:
                 role = item.get("role")
-                labels.append(f"missing: {role}" if role else f"missing: {state_name}")
+                b = _bounds_dict(item.get("bounds") or item.get("logical_bounds") or item.get("visible_bounds")) or slot
+                markers.append({
+                    "label": f"missing: {role}" if role else "missing",
+                    "state": state_name,
+                    "role": role,
+                    "bounds": b,
+                    "reason": item.get("reason"),
+                })
         break
-    return labels
+    # Merge markers that share the same box so one red rect can carry several roles.
+    merged = []
+    for marker in markers:
+        key = tuple(marker["bounds"][k] for k in ("left", "top", "right", "bottom")) if marker.get("bounds") else None
+        found = next((m for m in merged if m.get("_key") == key), None) if key is not None else None
+        if found:
+            if marker.get("role") and marker["role"] not in (found.get("roles") or []):
+                found.setdefault("roles", [])
+                found["roles"].append(marker["role"])
+                found["label"] = "missing: " + ", ".join(found["roles"])
+        else:
+            marker["_key"] = key
+            marker["roles"] = [marker["role"]] if marker.get("role") else []
+            merged.append(marker)
+    for marker in merged:
+        marker.pop("_key", None)
+    return merged
 
 
-def annotate_missing_state(image, labels):
-    """Mark a state preview when a part or state is listed as missing."""
+def annotate_missing_state(image, markers):
+    """Draw a red box and a 'missing' label on each truly missing state-dependent part."""
+    if not markers:
+        return image
     draw = ImageDraw.Draw(image)
-    font = load_font(28)
-    text = "  |  ".join(labels)
-    try:
-        tw = draw.textlength(text, font=font)
-    except Exception:
-        tw = 12 * len(text)
-    pad = 10
-    box = [pad, pad, pad + int(tw) + 16, pad + 36]
-    draw.rectangle(box, fill=(20, 20, 20))
-    draw.text((pad + 8, pad + 4), text, fill=(255, 210, 80), font=font)
+    font = load_font(24)
+    for marker in markers:
+        b = marker.get("bounds")
+        label = marker.get("label") or "missing"
+        if b:
+            l, top, r, bt = [int(round(b[k])) for k in ("left", "top", "right", "bottom")]
+            l, top = max(0, l), max(0, top)
+            r, bt = min(image.width - 1, r), min(image.height - 1, bt)
+            if r > l and bt > top:
+                for w in range(4):
+                    draw.rectangle([l + w, top + w, r - w, bt - w], outline=(220, 30, 30))
+                tx, ty = l, max(0, top - 28)
+            else:
+                tx, ty = 8, 8
+        else:
+            tx, ty = 8, 8
+        try:
+            tw = draw.textlength(label, font=font)
+        except Exception:
+            tw = 10 * len(label)
+        draw.rectangle([tx, ty, tx + int(tw) + 12, ty + 26], fill=(220, 30, 30))
+        draw.text((tx + 6, ty + 2), label, fill=(255, 255, 255), font=font)
     return image
 
 
@@ -2343,16 +2437,19 @@ def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=Non
         canvas, placed = recomposite(
             layout_with_nodes(layout, nodes), slices_dir, canvas_size, render_text=False
         )
-        missing_labels = missing_labels_for_state(layout, item.get("component_id"), item.get("state"))
+        markers = missing_markers_for_state(layout, item.get("component_id"), item.get("state"))
         rgb = canvas.convert("RGB")
-        if missing_labels:
-            annotate_missing_state(rgb, missing_labels)
+        if markers:
+            annotate_missing_state(rgb, markers)
         path = states_dir / f"{item['id']}.png"
         rgb.save(path)
         item_out = dict(item)
         item_out["path"] = str(path)
         item_out["placed"] = len(placed)
-        item_out["missing"] = missing_labels
+        item_out["missing"] = [
+            {k: v for k, v in m.items() if k != "bounds"} | ({"bounds": m["bounds"]} if m.get("bounds") else {})
+            for m in markers
+        ]
         written.append(item_out)
     index = {"count": len(written), "previews": written}
     (states_dir / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
