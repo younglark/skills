@@ -93,7 +93,7 @@ function grad(stops, smooth) {
     _obj: "gradientClassEvent",
     name: "custom",
     gradientForm: { _enum: "gradientForm", _value: "customStops" },
-    interfaceIconFrameDimmed: smooth,
+    interfaceIconFrameDimmed: smooth, // 渐变「平滑度」，0–4096 对应 0–100%（键名是 PS 历史遗留，照抄即可）
     colors: stops.map((s) => ({
       _obj: "colorStop",
       color: rgb(s[1]),
@@ -114,7 +114,7 @@ const type = {
   _obj: "gradientLayer",
   angle: ang(90),
   type: { _enum: "gradientType", _value: "linear" }, // 或 "shapeburst"
-  gradient: grad([[0, "#000000", 100], [4096, "#FFFFFF", 100]], 0),
+  gradient: grad([[0, "#000000", 100], [4096, "#FFFFFF", 100]], 4096),
   dither: true, align: true, scale: pct(100), reverse: false,
   gradientsInterpolationMethod: { _enum: "gradientInterpolationMethodType", _value: "classic" }
 };

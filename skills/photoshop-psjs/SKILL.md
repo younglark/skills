@@ -50,6 +50,7 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 - 文件系统：脚本无 manifest，权限由 Photoshop 内置。官方脚本章节仍写：可用文件选择器和 `getTemporaryFolder()`。`getEntryWithUrl` / `createSessionToken` 是官方 FileSystemProvider API（见第 4 节实测）。
 - `require("uxp").script` 提供 `executionContext`、`args`、`setResult(result)`。官方 FAQ（首发说明）曾写：**第一版不支持向脚本传参**。不要依赖命令行参数或 `script.args` 把任务配置传进去；把路径和参数写进脚本，或让脚本读旁边的 JSON。`setResult` 对「`Photoshop.exe` 启动后 agent 如何读返回值」**未核实**，用结果文件。
 - 同一时刻只能跑一个脚本，脚本不能再调另一个脚本。
+- 官方 `executionContext`：`isCancelled` / `onCancel` 用于响应用户取消，`reportProgress({ value, commandName })` 更新进度条，`hostControl.suspendHistory({ documentID, name })` + `resumeHistory(id, commit)` 把一批修改合成一步历史记录，方便美术一次撤销。
 
 ---
 
@@ -65,7 +66,8 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 - 若 Photoshop 已打开，脚本在**已有实例**里执行。
 - **启动器立即返回**，脚本在 PS 里异步继续跑。必须轮询脚本自己写的结果 JSON（建议含 `done`、`ok`、`fatal`、`errs`），不要看进程退出码判断成败。
 - 曾测：一个导出脚本把一个 `.psb` 导出为 28 张切片大约 18 秒（其中打开文件约 10 秒），并写 `export_log.json`。
-- 社区有报告：仅靠 Windows 文件关联双击 `.psjs` 可能只启动 PS 却不执行脚本；同一文件用 `File > Scripts > Browse` 正常。agent 启动请显式传 `Photoshop.exe` + 脚本路径，并始终以结果文件为准。
+- **未核实**：仅靠 Windows 文件关联双击 `.psjs` 可能只启动 PS 却不执行脚本。agent 启动请显式传 `Photoshop.exe` + 脚本路径，并始终以结果文件为准。
+- 启动前确认 PS 没有挂着模态对话框（崩溃后的「恢复文档」提示、存储对话框等）。有对话框时脚本不会按预期执行，轮询只会超时；超时后先截图看 PS 界面，不要盲目重跑。
 
 **远程 agent 流程：** 在 agent 侧写好 `.psjs` → 拷到装有 Photoshop 的机器（只用用户授权的目录）→ 用 shell 启动并轮询日志 → 把 PNG/PSD/日志拷回 → 需要时做像素对比。
 
@@ -127,7 +129,7 @@ await out.write(JSON.stringify(log, null, 2));
 
 - **禁止**改、存、关用户已打开且未保存的文档。
 - 跑脚本前记下 `app.documents.map(d => ({name: d.name, id: d.id}))`，结束后再记一次，写进日志。
-- 只把**本脚本创建或本脚本打开**的文档 id 放进 `ours`；所有 `batchPlay`、保存、关闭之前检查 `app.activeDocument.id` 是否在集合里。
+- 只把**本脚本创建或本脚本打开**的文档 id 放进 `ours`；所有 `batchPlay`、保存、关闭之前检查 `app.activeDocument.id` 是否在集合里。这个守卫只对「隐式指向当前文档」的描述符有效；如果描述符里显式写了 `{ _ref: "document", _id }`，那个 id 也要过守卫。
 - 切片时用「当前图层新建文档」会多出一个文档：新文档 id 也要加入 `ours`，用完 `closeWithoutSaving()`，再把 `app.activeDocument` 切回主文档。失败时同样只关 `ours` 里的文档。
 - 官方：`executionContext.hostControl.registerAutoCloseDocument(docID)` 可在用户取消或 modal 结束时自动关闭临时文档；成功保存并打算留给美术继续改时，先 `unregisterAutoCloseDocument`。
 
