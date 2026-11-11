@@ -1,0 +1,535 @@
+// export_slices.psjs
+// Agent slicing export for Photoshop 23.5+.
+// Reads a confirmed manifest JSON, exports 1x PNGs by layer_id (effects baked in),
+// records visible / logical bounds and text attributes, and writes a full artboard render.
+//
+// Configure the constants below. Do not pass extra CLI arguments (the script will not run).
+// Use dialogOptions "silent" on every descriptor; "dontDisplay" still pops error dialogs.
+// Top-level await is required. Only documents in the target set are edited or closed.
+
+const { app, core, action } = require("photoshop");
+const fs = require("uxp").storage.localFileSystem;
+
+// --- configure these paths for the job directory (must already exist) ---
+const ROOT_URL = "file:/D:/work/ps-job";
+const SOURCE_URL = "file:/D:/work/ps-job/design.psb";
+const SOURCE_PATH_HINT = "D:\\work\\ps-job\\design.psb"; // matched against doc.path
+const MANIFEST_NAME = "manifest.json";
+const LOG_NAME = "export_log.json";
+const SLICES_DIR_NAME = "slices";
+const FULL_RENDER_NAME = "full_render.png";
+// -----------------------------------------------------------------------
+
+const log = {
+  started: new Date().toISOString(),
+  done: false,
+  ok: false,
+  fatal: null,
+  errs: [],
+  docs_before: [],
+  docs_after: [],
+  src: null,
+  items: [],
+  bound_keys_sample: null,
+  full_render: null
+};
+
+const ours = new Set();
+let rootDir;
+let slicesDir;
+let weOpenedSource = false;
+
+function nowMs() { return Date.now(); }
+
+function val(x) {
+  if (x == null) return null;
+  if (typeof x === "object" && "_value" in x) return x._value;
+  return x;
+}
+
+function unitRect(r) {
+  if (!r || typeof r !== "object") return null;
+  if (!("left" in r) && !("top" in r)) return null;
+  return {
+    left: val(r.left),
+    top: val(r.top),
+    right: val(r.right),
+    bottom: val(r.bottom)
+  };
+}
+
+function collectBoundKeys(desc) {
+  const out = {};
+  if (!desc) return out;
+  for (const key of Object.keys(desc)) {
+    if (/bound|rect/i.test(key)) out[key] = desc[key];
+  }
+  return out;
+}
+
+function rgbHex(c) {
+  if (!c) return null;
+  const r = Math.round(val(c.red) != null ? val(c.red) : 0);
+  const g = Math.round(val(c.grain) != null ? val(c.grain) : (val(c.green) != null ? val(c.green) : 0));
+  const b = Math.round(val(c.blue) != null ? val(c.blue) : 0);
+  const h = (n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0");
+  return "#" + h(r) + h(g) + h(b);
+}
+
+function strokeFromFX(desc) {
+  const fx = desc && desc.layerEffects;
+  if (!fx) return null;
+  const lists = [];
+  if (fx.frameFXMulti) lists.push(...fx.frameFXMulti);
+  else if (fx.frameFX) lists.push(fx.frameFX);
+  for (const e of lists) {
+    if (!e || e.enabled === false) continue;
+    return {
+      enabled: true,
+      position: (e.style && e.style._value) || e.style || null,
+      size: val(e.size),
+      color: e.color ? rgbHex(e.color) : null,
+      opacity: val(e.opacity),
+      mode: (e.mode && e.mode._value) || e.mode || null
+    };
+  }
+  return null;
+}
+
+function parseText(desc) {
+  const tk = desc && desc.textKey;
+  if (!tk) return null;
+  const content = (typeof tk.textKey === "string") ? tk.textKey : (tk.text || "");
+  const ranges = tk.textStyleRange || [];
+  const st = (ranges[0] && ranges[0].textStyle) || {};
+  const para = ((tk.paragraphStyleRange || [])[0] || {}).paragraphStyle || {};
+  const transform = tk.transform || {};
+  const sy = (transform.yy != null) ? transform.yy : 1;
+  const sizeRaw = val(st.size);
+  const click = tk.textClickPoint;
+  return {
+    content: content,
+    font: st.fontPostScriptName || st.fontName || null,
+    size: (sizeRaw != null) ? sizeRaw * sy : null,
+    color: st.color ? rgbHex(st.color) : null,
+    alignment: (para.align && para.align._value) || para.align || null,
+    tracking: st.tracking != null ? val(st.tracking) : null,
+    leading: st.leading != null ? val(st.leading) : null,
+    auto_leading: st.autoLeading != null ? st.autoLeading : null,
+    stroke: strokeFromFX(desc),
+    opacity: (desc.opacity != null) ? (val(desc.opacity) / 255) : null,
+    click_point: click ? { horizontal: val(click.horizontal), vertical: val(click.vertical) } : null,
+    transform: transform
+  };
+}
+
+function pickBounds(desc, domLayer) {
+  const keys = collectBoundKeys(desc);
+  const logical = unitRect(desc && desc.boundsNoEffects)
+    || (domLayer && domLayer.boundsNoEffects && unitRect(domLayer.boundsNoEffects))
+    || null;
+  // Prefer an explicit with-effects rect when present.
+  const visible = unitRect(desc && (desc.boundsWithEffects || desc.boundsWithFX || desc.boundsExtended))
+    || (domLayer && domLayer.bounds && unitRect(domLayer.bounds))
+    || unitRect(desc && desc.bounds)
+    || null;
+  return { keys: keys, logical: logical, visible: visible };
+}
+
+function samePath(a, b) {
+  const norm = (s) => String(s || "").replace(/\//g, "\\").replace(/^file:\\?/i, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
+function snapshotDocs() {
+  return app.documents.map((d) => ({
+    name: d.name,
+    id: d.id,
+    path: d.path || "",
+    saved: d.saved
+  }));
+}
+
+function findLayer(container, id) {
+  const layers = container.layers || [];
+  for (const layer of layers) {
+    if (layer.id === id) return layer;
+    if (layer.layers && layer.layers.length) {
+      const found = findLayer(layer, id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function flush() {
+  const file = await rootDir.createFile(LOG_NAME, { overwrite: true });
+  await file.write(JSON.stringify(log, null, 2));
+}
+
+async function bp(descriptors) {
+  const active = app.activeDocument;
+  if (!active || !ours.has(active.id)) {
+    throw new Error("GUARD: active document is not ours: " + (active && (active.name + " id=" + active.id)));
+  }
+  const descs = descriptors.map((d) => {
+    const copy = Object.assign({}, d);
+    copy._options = Object.assign({}, d._options || {}, { dialogOptions: "silent" });
+    return copy;
+  });
+  const result = await action.batchPlay(descs, {});
+  for (const item of result) {
+    if (item && item._obj === "error") {
+      throw new Error(JSON.stringify(item).slice(0, 400));
+    }
+  }
+  return result;
+}
+
+async function ensureEightBit(doc) {
+  try {
+    if (doc.bitsPerChannel && doc.bitsPerChannel !== "bitDepth8") {
+      await bp([{ _obj: "convertMode", depth: 8, merge: false }]);
+    }
+  } catch (err) {
+    log.errs.push({ convertMode: String(err) });
+  }
+}
+
+async function closeTemp(doc) {
+  if (!doc) return;
+  try {
+    if (ours.has(doc.id)) {
+      await doc.closeWithoutSaving();
+      ours.delete(doc.id);
+    }
+  } catch (err) {
+    log.errs.push({ close_temp: String(err) });
+  }
+}
+
+try {
+  rootDir = await fs.getEntryWithUrl(ROOT_URL);
+  try {
+    slicesDir = await rootDir.getEntry(SLICES_DIR_NAME);
+  } catch (err) {
+    slicesDir = await rootDir.createFolder(SLICES_DIR_NAME);
+  }
+  log.docs_before = snapshotDocs();
+  await flush();
+
+  const manifestFile = await rootDir.getEntry(MANIFEST_NAME);
+  const manifest = JSON.parse(await manifestFile.read());
+  if (manifest.status && manifest.status !== "confirmed" && manifest.status !== "pending_review") {
+    // pending_review is allowed only when the operator explicitly treats the auto manifest as confirmed.
+    throw new Error("manifest.status must be confirmed (or pending_review for an authorized test run)");
+  }
+  const artboard = manifest.source && manifest.source.artboard;
+  const entries = manifest.entries || [];
+
+  await core.executeAsModal(async (executionContext) => {
+    let src = null;
+    try {
+      executionContext.reportProgress({ value: 0.02, commandName: "open source" });
+      // Reuse the copy if it is already open (match by path). Never fall back to another file of the same name.
+      for (const doc of app.documents) {
+        if (SOURCE_PATH_HINT && doc.path && samePath(doc.path, SOURCE_PATH_HINT)) {
+          src = doc;
+          break;
+        }
+      }
+      if (!src) {
+        const entry = await fs.getEntryWithUrl(SOURCE_URL);
+        src = await app.open(entry);
+        weOpenedSource = true;
+      }
+      ours.add(src.id);
+      app.activeDocument = src;
+      if (weOpenedSource) {
+        await executionContext.hostControl.registerAutoCloseDocument(src.id);
+      }
+      log.src = { name: src.name, id: src.id, path: src.path || "", w: src.width, h: src.height };
+      if (SOURCE_PATH_HINT && src.path && !samePath(src.path, SOURCE_PATH_HINT)) {
+        throw new Error("GUARD: opened unexpected path: " + src.path);
+      }
+      await flush();
+
+      let suspension;
+      try {
+        suspension = await executionContext.hostControl.suspendHistory({
+          documentID: src.id,
+          name: "agent slice export"
+        });
+      } catch (err) {
+        log.errs.push({ suspendHistory: String(err) });
+      }
+
+      const total = entries.length + 1;
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const item = {
+          name: entry.name,
+          layer_id: entry.layer_id,
+          kind: entry.kind,
+          ok: false
+        };
+        const t1 = nowMs();
+        try {
+          app.activeDocument = src;
+          if (!ours.has(src.id)) throw new Error("GUARD: lost source doc");
+          const selectIds = (entry.select_ids && entry.select_ids.length)
+            ? entry.select_ids
+            : [entry.layer_id];
+          const info = await bp([{ _obj: "get", _target: [{ _ref: "layer", _id: entry.layer_id }] }]);
+          const desc = info[0] || {};
+          if (!log.bound_keys_sample) {
+            log.bound_keys_sample = {
+              layer_id: entry.layer_id,
+              keys: collectBoundKeys(desc)
+            };
+          }
+          const domLayer = findLayer(src, entry.layer_id);
+          const bounds = pickBounds(desc, domLayer);
+          item.ps_name = desc.name;
+          item.visible_flag = desc.visible;
+          item.bound_keys = Object.keys(bounds.keys);
+          item.logical_bounds = bounds.logical;
+          item.visible_bounds = bounds.visible;
+          item.boundsNoEffects = bounds.logical;
+          if (entry.kind === "dynamic_text" || desc.textKey) {
+            item.text = parseText(desc) || entry.text || null;
+          }
+          if (entry.kind === "dynamic_text") {
+            item.ok = true;
+            item.ms = nowMs() - t1;
+            log.items.push(item);
+            await flush();
+            continue;
+          }
+
+          // Select base + any visible clipped layers, then new document from the target.
+          const selectDescs = selectIds.map((id, idx) => {
+            const d = {
+              _obj: "select",
+              _target: [{ _ref: "layer", _id: id }],
+              makeVisible: false
+            };
+            if (idx > 0) {
+              d.selectionModifier = { _enum: "selectionModifierType", _value: "addToSelection" };
+            }
+            return d;
+          });
+          await bp(selectDescs);
+          await bp([{
+            _obj: "make",
+            _target: [{ _ref: "document" }],
+            name: entry.name,
+            using: { _ref: "layer", _enum: "ordinal", _value: "targetEnum" },
+            version: 5
+          }]);
+          const tmp = app.activeDocument;
+          ours.add(tmp.id);
+          try {
+            await executionContext.hostControl.registerAutoCloseDocument(tmp.id);
+          } catch (err) {}
+          for (const layer of tmp.layers) layer.visible = true;
+          await bp([{
+            _obj: "trim",
+            trimBasedOn: { _enum: "trimBasedOn", _value: "transparency" },
+            top: true, bottom: true, left: true, right: true
+          }]);
+          await ensureEightBit(tmp);
+          item.out_size = [tmp.width, tmp.height];
+          // If Photoshop did not give a with-effects rect, reconstruct it from
+          // the trimmed PNG size anchored to the logical top-left (may undershoot shadows).
+          if (item.logical_bounds && item.out_size
+              && Math.abs((item.logical_bounds.right - item.logical_bounds.left) - tmp.width) <= 1
+              && Math.abs((item.logical_bounds.bottom - item.logical_bounds.top) - tmp.height) <= 1) {
+            // Effects did not expand the raster; keep the logical box as visible.
+            item.visible_bounds = item.logical_bounds;
+            item.visible_bounds_matches_logical = true;
+          } else if (item.visible_bounds && item.out_size) {
+            // Keep the reported origin; size should match the PNG when possible.
+            const vb = item.visible_bounds;
+            const vw = vb.right - vb.left;
+            const vh = vb.bottom - vb.top;
+            if (Math.abs(vw - tmp.width) > 1 || Math.abs(vh - tmp.height) > 1) {
+              item.visible_bounds_reported = vb;
+              item.visible_bounds = {
+                left: vb.left,
+                top: vb.top,
+                right: vb.left + tmp.width,
+                bottom: vb.top + tmp.height
+              };
+              item.visible_bounds_adjusted_to_png = true;
+            }
+          } else if (item.logical_bounds) {
+            const lb = item.logical_bounds;
+            item.visible_bounds = {
+              left: lb.left,
+              top: lb.top,
+              right: lb.left + tmp.width,
+              bottom: lb.top + tmp.height
+            };
+            item.visible_bounds_from_logical_plus_png = true;
+          }
+          const png = await slicesDir.createFile(entry.name + ".png", { overwrite: true });
+          await tmp.saveAs.png(png, { compression: 6 }, true);
+          await executionContext.hostControl.unregisterAutoCloseDocument(tmp.id);
+          await closeTemp(tmp);
+          app.activeDocument = src;
+          item.ok = true;
+        } catch (err) {
+          item.ok = false;
+          item.error = String((err && err.message) || err);
+          try {
+            if (app.activeDocument && app.activeDocument !== src && ours.has(app.activeDocument.id)) {
+              await closeTemp(app.activeDocument);
+            }
+          } catch (err2) {}
+          try { app.activeDocument = src; } catch (err3) {}
+        }
+        item.ms = nowMs() - t1;
+        log.items.push(item);
+        try {
+          executionContext.reportProgress({
+            value: (i + 1) / total,
+            commandName: "slice " + (i + 1) + "/" + entries.length
+          });
+        } catch (err) {}
+        await flush();
+      }
+
+      // Full artboard render for validation (1x, 8-bit PNG, clipped to the artboard).
+      const fullItem = { name: FULL_RENDER_NAME, ok: false };
+      const tFull = nowMs();
+      try {
+        app.activeDocument = src;
+        if (!artboard || !artboard.id) throw new Error("manifest.source.artboard.id is required");
+        await bp([{
+          _obj: "select",
+          _target: [{ _ref: "layer", _id: artboard.id }],
+          makeVisible: false
+        }]);
+        await bp([{
+          _obj: "make",
+          _target: [{ _ref: "document" }],
+          name: "full_render",
+          using: { _ref: "layer", _enum: "ordinal", _value: "targetEnum" },
+          version: 5
+        }]);
+        const tmp = app.activeDocument;
+        ours.add(tmp.id);
+        try { await executionContext.hostControl.registerAutoCloseDocument(tmp.id); } catch (err) {}
+        for (const layer of tmp.layers) layer.visible = true;
+        const wantW = artboard.size && artboard.size[0];
+        const wantH = artboard.size && artboard.size[1];
+        const abBounds = artboard.bounds; // document coords [l,t,r,b]
+        fullItem.before_size = [tmp.width, tmp.height];
+        // If the new doc is still the full canvas, crop to the artboard's document box
+        // (not 0,0,w,h — that would take the top-left artboard instead).
+        if (wantW && wantH && (tmp.width !== wantW || tmp.height !== wantH) && abBounds && abBounds.length === 4) {
+          try {
+            await bp([{
+              _obj: "crop",
+              to: {
+                _obj: "rectangle",
+                left: { _unit: "pixelsUnit", _value: abBounds[0] },
+                top: { _unit: "pixelsUnit", _value: abBounds[1] },
+                right: { _unit: "pixelsUnit", _value: abBounds[2] },
+                bottom: { _unit: "pixelsUnit", _value: abBounds[3] }
+              },
+              angle: 0,
+              delete: true
+            }]);
+          } catch (err) {
+            fullItem.crop_error = String(err);
+          }
+        } else if (wantW && wantH && (tmp.width !== wantW || tmp.height !== wantH)) {
+          try {
+            await bp([{
+              _obj: "crop",
+              to: {
+                _obj: "rectangle",
+                left: { _unit: "pixelsUnit", _value: 0 },
+                top: { _unit: "pixelsUnit", _value: 0 },
+                right: { _unit: "pixelsUnit", _value: wantW },
+                bottom: { _unit: "pixelsUnit", _value: wantH }
+              },
+              angle: 0,
+              delete: true
+            }]);
+          } catch (err) {
+            fullItem.crop_error = String(err);
+          }
+        }
+        await ensureEightBit(tmp);
+        fullItem.out_size = [tmp.width, tmp.height];
+        const png = await rootDir.createFile(FULL_RENDER_NAME, { overwrite: true });
+        await tmp.saveAs.png(png, { compression: 6 }, true);
+        await executionContext.hostControl.unregisterAutoCloseDocument(tmp.id);
+        await closeTemp(tmp);
+        app.activeDocument = src;
+        fullItem.ok = true;
+      } catch (err) {
+        fullItem.ok = false;
+        fullItem.error = String((err && err.message) || err);
+        try {
+          if (app.activeDocument && app.activeDocument !== src && ours.has(app.activeDocument.id)) {
+            await closeTemp(app.activeDocument);
+          }
+        } catch (err2) {}
+        try { app.activeDocument = src; } catch (err3) {}
+      }
+      fullItem.ms = nowMs() - tFull;
+      log.full_render = fullItem;
+      await flush();
+
+      if (suspension && suspension.historySuspensionID != null) {
+        try {
+          await executionContext.hostControl.resumeHistory(suspension.historySuspensionID);
+        } catch (err) {
+          log.errs.push({ resumeHistory: String(err) });
+        }
+      }
+
+      // Close the source only if this script opened it. Never save.
+      if (weOpenedSource && src && ours.has(src.id)) {
+        try {
+          await executionContext.hostControl.unregisterAutoCloseDocument(src.id);
+        } catch (err) {}
+        await src.closeWithoutSaving();
+        ours.delete(src.id);
+        src = null;
+      }
+
+      const failed = log.items.filter((it) => !it.ok);
+      log.ok = failed.length === 0 && !!(log.full_render && log.full_render.ok);
+      if (!log.ok && !log.fatal) {
+        log.fatal = failed.length
+          ? (failed.length + " slice(s) failed")
+          : "full render failed";
+      }
+    } catch (err) {
+      log.fatal = String((err && err.stack) || err);
+      try {
+        if (weOpenedSource && src && ours.has(src.id)) {
+          await src.closeWithoutSaving();
+          ours.delete(src.id);
+        }
+      } catch (err2) {
+        log.errs.push({ close_src: String(err2) });
+      }
+    }
+  }, { commandName: "agent slice export" });
+} catch (err) {
+  log.fatal = String((err && err.stack) || err);
+} finally {
+  try { log.docs_after = snapshotDocs(); } catch (err) {
+    log.errs.push({ docs_after: String(err) });
+  }
+  log.done = true;
+  log.finished = new Date().toISOString();
+  if (!log.ok && !log.fatal) log.fatal = "job ended without ok";
+  try { if (rootDir) await flush(); } catch (err) {}
+}

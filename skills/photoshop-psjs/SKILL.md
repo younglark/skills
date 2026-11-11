@@ -1,6 +1,6 @@
 ---
 name: Photoshop UXP scripts (.psjs)
-description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psjs): write, launch, poll, and verify document create/edit/export from an agent. Covers executeAsModal, batchPlay, file tokens, doc-id safety, and psjs vs UXP plugins vs ExtendScript/JSX. Chinese triggers: psjs驱动Photoshop, UXP脚本, batchPlay, executeAsModal, 用脚本改PSD, 从命令行跑Photoshop脚本, 图层样式脚本, 导出切片. Do NOT use for UXP plugin/panel or MCP-bridge development, ExtendScript/JSX-only work, or read-only PSD inspection that psd-tools/ag-psd can do without launching Photoshop."
+description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psjs): write, launch, poll, and verify document create/edit/export from an agent. Covers executeAsModal, batchPlay, file tokens, doc-id safety, and psjs vs UXP plugins vs ExtendScript/JSX. Chinese triggers: psjs驱动Photoshop, UXP脚本, batchPlay, executeAsModal, 用脚本改PSD, 从命令行跑Photoshop脚本, 图层样式脚本, 导出切片, 切图工作流, 九宫格, 切图清单, 布局JSON. Do NOT use for UXP plugin/panel or MCP-bridge development, ExtendScript/JSX-only work, or read-only PSD inspection that psd-tools/ag-psd can do without launching Photoshop."
 ---
 
 # 用 UXP 脚本 (.psjs) 驱动 Photoshop
@@ -21,6 +21,7 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 **用 `.psjs` 当：**
 
 - 需要 Photoshop 才能做的事：渲染带图层样式的像素、按图层导出切片、用 batchPlay 建形状/文字/效果、把结果存成 PSD/PNG。
+- 从 PSD/PSB 推断切图清单、审核后导出 1x PNG 和引擎无关的布局 JSON：见第 9 节。
 - agent 要一次性跑完任务（写脚本 → 启动 → 轮询日志 → 拷回产物），不需要常驻面板。
 
 **不要启动 Photoshop 当：**
@@ -208,3 +209,22 @@ await out.write(JSON.stringify(log, null, 2));
 - [Samples](https://developer.adobe.com/photoshop/uxp/2022/scripting/samples/)
 
 实测补充见上文各节，来自用 `.psjs` 批量建 UI 组件并与金图对像素的工作，不是 Adobe 标准。
+
+---
+
+## 9. Agent 切图工作流
+
+把可见图层切成游戏引擎可导入的 1x PNG，并产出一份引擎无关的中间布局 JSON。细节、schema、命名规则、九宫格启发式和实测见 [references/slicing.md](references/slicing.md)。脚本与 Python 助手： [examples/export_slices.psjs](examples/export_slices.psjs)、[examples/slicing_helper.py](examples/slicing_helper.py)。
+
+**流程（确认前不导出）：**
+
+1. **推断（离线）**：用 `psd-tools` 读图层树，只看可见图层（隐藏的完全忽略，状态要靠美术在 PSD 里显式打开）。为每条切图生成 `layer_id`、源图层名/路径（仅供对照）、规范名 `模块_类型_用途_状态`（小写，禁止直接用 PSD 图层名）、类型 `image` | `nine_slice` | `dynamic_text` | `art_text`，以及按像素分析算出的九宫格边距。底图、高亮、图标、文字是独立资源，不要烘焙到一张图里。
+2. **审核门闩**：输出标注预览图（框出每个切图、标规范名和九宫格线）和 manifest JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。
+3. **导出（`.psjs`）**：按 `layer_id`（及可见剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份，不去重。`dynamic_text` 不出图，只导出文本、字体 PostScript 名、字号、颜色、描边、对齐等属性；`art_text` 出图。
+4. **布局 JSON**：引擎无关的中间格式，记录层级、可见尺寸（含效果）、逻辑尺寸（不含效果）、按逻辑尺寸中心计算的锚点、九宫格边距、文本属性和对应图片。各引擎导入器自己写，不在本 skill 里。
+5. **校验**：按元数据把切图拼回去，和 PS 整图画板对比像素差 / CIEDE2000 ΔE（同时给出遮罩动态文字区域后的数字）；再检查漏切、重名、空图。
+
+沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
+
+**实测（Windows / PS 2026，排行榜.psb 副本，画板「排行榜_总榜」1080×2340）：** 推断 65 条（最终 image 18 / nine_slice 21 / dynamic_text 24 / art_text 2），约 83 秒（需提高 `psd-tools` 的 `ParseLimits`，渐变合成需 scipy）；审核预览已生成，测试中将自动清单视为已确认；导出 65/65 成功、41 张 PNG，约 43 秒；漏切/重名/空图为 0。和 PS 整图对比：全图 mean ΔE 4.082、p95 ΔE 34.063；遮罩动态文字后 mean ΔE 2.599、p95 ΔE 13.569。剩余差距主要来自动态文字（故意不出图）、页签/底栏重叠层的普通叠放，以及部分投影边缘。
+
