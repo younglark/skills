@@ -8,7 +8,7 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 面向 agent 的可执行配方：在 Photoshop 里创建、修改、导出文档。事实分两类：
 
 - **官方**：来自 Adobe UXP 文档，文末有链接。
-- **实测**：在 Windows、Adobe Photoshop 2026 上用 `.psjs` 跑通的经验。未核实的标为 **未核实**，不要当成官方 API。
+- **实测**：在 Windows 和 macOS、Adobe Photoshop 2026 上用 `.psjs` 跑通的经验。未核实的标为 **未核实**，不要当成官方 API。
 
 **成功标准：** 脚本写完结果 JSON（含 `done` / `ok` / `fatal` / `errs`）；只改动任务指定的目标文档，其他打开的文档不受影响；需要像素对齐时，导出 PNG 并与金图做 ΔE / 像素差后迭代。
 
@@ -96,13 +96,27 @@ do {
 } while ($true)
 ```
 
-**macOS：** 官方支持拖到 Dock / 窗口。下面这条启动方式 **未核实**（未见官方文档，本仓库也未在 macOS 上实测）：
+**macOS（实测，Photoshop 2026，Mac mini）：** 官方只写了拖到 Dock / 窗口；下面的命令行启动未见官方文档，但已实测可用：
 
 ```bash
 open -a "Adobe Photoshop 2026" /path/to/run_job.psjs
+# 已关联 .psjs 时也可：open /path/to/run_job.psjs
 ```
 
-同样必须轮询结果文件。
+- **冷启动**：PS 未运行时，`open -a` 约 0.3 秒返回（exit 0），PS 启动后自动执行脚本，约 8 秒写出结果文件。
+- **热启动**：PS 已运行时，脚本在现有实例里执行，几秒内写出结果。
+- 不带 `-a`、走文件关联的 `open xxx.psjs` 同样会执行。
+- `getEntryWithUrl("file:/Users/<user>/...")` 无选择器可写文件。
+- 和 Windows 一样：启动器立即返回，必须轮询结果文件，不要加额外命令行参数。
+
+轮询示例（zsh）：
+
+```bash
+log=~/ps-job/job_log.json; rm -f "$log"
+open -a "Adobe Photoshop 2026" ~/ps-job/run_job.psjs
+for i in {1..300}; do [ -f "$log" ] && grep -q '"done":true' "$log" && break; sleep 2; done
+cat "$log"
+```
 
 骨架脚本见 [examples/run_job.psjs](examples/run_job.psjs)（顶层 await、`executeAsModal`、文档 id 守卫、结果文件、`try/catch`）。**实测：** 按此骨架跑通：写出 `done`/`ok`、导出 `preview.png`、关闭自己建的文档，其它已开文档的 id 集合不变。
 
