@@ -1,0 +1,111 @@
+// run_job.psjs
+// Agent-driven UXP script skeleton for Photoshop 23.5+.
+// Top-level await is required. Configure paths in this file (CLI args are not reliable).
+// Only documents this script creates are saved or closed.
+
+const { app, core, action } = require("photoshop");
+const fs = require("uxp").storage.localFileSystem;
+
+const ROOT_URL = "file:/D:/work/ps-job"; // directory must already exist
+const LOG_NAME = "job_log.json";
+
+const log = {
+  started: new Date().toISOString(),
+  done: false,
+  ok: false,
+  fatal: null,
+  errs: [],
+  docs_before: [],
+  docs_after: [],
+  doc_id: null
+};
+
+const ours = new Set();
+let rootDir;
+
+async function flush() {
+  const file = await rootDir.createFile(LOG_NAME, { overwrite: true });
+  await file.write(JSON.stringify(log, null, 2));
+}
+
+async function bp(descriptors) {
+  const active = app.activeDocument;
+  if (!active || !ours.has(active.id)) {
+    throw new Error("GUARD: active document is not ours: " + (active && active.name));
+  }
+  const result = await action.batchPlay(descriptors, {});
+  for (const item of result) {
+    if (item && item._obj === "error") {
+      throw new Error(JSON.stringify(item).slice(0, 400));
+    }
+  }
+  return result;
+}
+
+try {
+  rootDir = await fs.getEntryWithUrl(ROOT_URL);
+  log.docs_before = app.documents.map((doc) => ({ name: doc.name, id: doc.id }));
+  await flush();
+
+  await core.executeAsModal(async (executionContext) => {
+    let doc;
+    try {
+      doc = await app.createDocument({
+        width: 800,
+        height: 600,
+        resolution: 72,
+        mode: "RGBColorMode",
+        fill: "transparent",
+        name: "agent_job"
+      });
+      ours.add(doc.id);
+      log.doc_id = doc.id;
+      await executionContext.hostControl.registerAutoCloseDocument(doc.id);
+      await flush();
+
+      const layer = await doc.createLayer({ name: "hello" });
+      await bp([{
+        _obj: "set",
+        _target: [{ _ref: "layer", _id: layer.id }],
+        to: { _obj: "layer", name: "hello" },
+        _options: { dialogOptions: "dontDisplay" }
+      }]);
+
+      const png = await rootDir.createFile("preview.png", { overwrite: true });
+      await doc.saveAs.png(png, { compression: 6 }, true);
+
+      await executionContext.hostControl.unregisterAutoCloseDocument(doc.id);
+      log.ok = true;
+    } catch (err) {
+      log.fatal = String((err && err.stack) || err);
+    }
+    try {
+      if (doc && ours.has(doc.id)) {
+        await doc.closeWithoutSaving();
+        ours.delete(doc.id);
+      }
+    } catch (err) {
+      log.errs.push({ close: String(err) });
+    }
+  }, { commandName: "agent job" });
+} catch (err) {
+  log.fatal = String((err && err.stack) || err);
+} finally {
+  try {
+    log.docs_after = app.documents.map((doc) => ({ name: doc.name, id: doc.id }));
+  } catch (err) {
+    log.errs.push({ docs_after: String(err) });
+  }
+  log.done = true;
+  log.finished = new Date().toISOString();
+  if (!log.ok && !log.fatal) {
+    log.fatal = "job ended without ok";
+  }
+  try {
+    if (rootDir) {
+      await flush();
+    }
+  } catch (err) {
+    // Last resort: nothing else we can write.
+  }
+}
