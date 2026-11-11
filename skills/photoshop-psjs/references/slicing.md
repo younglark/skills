@@ -1,179 +1,394 @@
 # Agent 切图工作流
 
-用 `psd-tools` 离线推断、人工审核、再由 `.psjs` 按 `layer_id` 导出 1x PNG，最后写出引擎无关的布局 JSON 并做像素校验。启动、守卫、`silent` 等规则见 [SKILL.md](../SKILL.md)。模板：[examples/export_slices.psjs](../examples/export_slices.psjs)、[examples/slicing_helper.py](../examples/slicing_helper.py)。
+助手只准备材料；跑这个 skill 的 **agent**（大模型）阅读材料后编写 manifest（组件、部件、状态、规范名）。用户改 JSON 确认后，再由 `.psjs` 按 `layer_id` 导出 1x PNG，写出引擎无关的布局 JSON，并校验默认状态拼图。启动、守卫、`silent` 等规则见 [SKILL.md](../SKILL.md)。模板：[examples/export_slices.psjs](../examples/export_slices.psjs)、[examples/slicing_helper.py](../examples/slicing_helper.py)。
 
 助手子命令：
 
 ```text
-python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画板名或id>] [--rules naming_rules.json]
+python slicing_helper.py prepare --psd design.psb --out-dir out [--artboard <画板名或id>]
+python slicing_helper.py flatten --manifest out/manifest.json
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
 python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir <字体目录>]
+# 可选：关键词草稿，只写 draft_manifest.json，不能代替 agent 编写的 manifest
+python slicing_helper.py infer --psd design.psb --out-dir out [--artboard <画板名或id>] [--rules naming_rules.json]
 ```
 
-依赖：`psd-tools`、Pillow、numpy。渐变填充的预览/九宫格分析还需要 `scipy`（`pip install scipy` 或 `psd-tools[composite]`）。大 PSD/PSB 打开时把 `ParseLimits.max_objects` 设为 `None`，否则默认 1,000,000 会直接失败（实测）。
+`--artboard` 可选；省略则处理所有可见顶层画板，没有画板时处理整份画布。`--rules` 只是给 agent 看的项目命名约定，不再作为自动分类的主路径。
+
+依赖：`psd-tools`、Pillow、numpy。预览合成与九宫格分析还需要 `scipy`（`pip install scipy` 或 `psd-tools[composite]`）。大 PSD/PSB 打开时把 `ParseLimits.max_objects` 设为 `None`，否则默认 1,000,000 会直接失败（实测）。
 
 ---
 
-## 1. 推断（只处理可见图层）
+## 1. 分工
 
-- 隐藏图层整棵子树都忽略。交互状态必须由美术在 PSD 里显式打开，助手不会把隐藏的 on/off 层标出来。
-- `--artboard` 可选，值为画板名或 `layer_id`。省略时处理所有可见的顶层画板；文档没有画板时，把整份画布当作一个目标。多个目标时，每个画板写到 `--out-dir/<slug>/`，并在 `--out-dir/index.json` 里列出。
-- 项目相关的命名词表（关键词 → 模块/类型/用途/状态、固定文案词）放在外部规则文件里，用 `--rules` 加载。示例见 [examples/naming_rules.example.json](../examples/naming_rules.example.json)。不传 `--rules` 时使用内置的通用默认规则，核心不绑定某一份 PSD。
-- 含可见文字的组、带 `*_on` / `*_off` 状态子层的组、以及「大底板 + 小图标」的组要下钻，把底图、高亮、图标、文字拆成独立资源，不要烘焙成一张图。
-- 纯图形组（如奖牌、头像框）以及叶子层（像素 / 形状 / 智能对象）连同其上方可见剪贴层，作为一条切图，记录 `select_ids`。
-- 调整图层、空图层（宽或高为 0）跳过。
-- `psd-tools` 的 bbox 是逻辑尺寸，**不含**图层效果。最终可见尺寸以 Photoshop 导出为准。
+| 谁 | 做什么 |
+|----|--------|
+| 助手 `prepare` | 准备材料：默认状态整图预览、带 id 的逐层裁切缩略图、含隐藏层的图层树 JSON、基于像素的九宫格候选。不做命名，不组组件，不判定状态。 |
+| **Agent** | 同时看整图、裁切图和图层树，编写 `manifest.json`：组件、部件、规范名、类型、状态和语义层级。 |
+| 用户 | 看标注预览，改 JSON 确认；`status` 在确认前保持 `pending_review`。真正缺失的状态列在 `missing` 里，由用户决定要不要补图。 |
+| 助手 `flatten` + `.psjs` 导出 | 把组件树展平为导出条目；按 `layer_id` 出 1x PNG。属于已识别交互组件某状态的隐藏层可临时显示后导出，然后恢复可见性，文档不保存。 |
+| 助手 `build-layout` / `validate` | 写出按组件语义组织的布局 JSON；把**默认状态**拼回去与 PS 整图对比；再为每个交替状态单独出预览图。 |
 
-每条 manifest 记录：
+隐藏层里与交互状态无关的内容忽略，不要导出。任何状态如果在 PSD 里完全没画（可见层和隐藏层都没有），只能写进 `missing`，**禁止捏造**。
 
-| 字段 | 说明 |
+`infer` 仍可用，但只写出 `draft_manifest.json`（`status: draft_for_agent_review`）。那是关键词草稿，agent 必须审过或重写，不能直接当确认清单导出。
+
+---
+
+## 2. 准备材料：要看什么
+
+`prepare` 在 `--out-dir` 写出：
+
+| 文件 | 用途 |
 |------|------|
-| `name` | 规范名，见第 4 节 |
-| `layer_id` | 与 UXP `layer.id` 一致，用来定位，不要按重名 |
-| `select_ids` | 导出时要多选的图层（自身 + 可见剪贴层） |
-| `source_name` / `source_path` | 仅供对照，禁止当作输出文件名 |
-| `kind` | `image` \| `nine_slice` \| `dynamic_text` \| `art_text` |
-| `logical_bounds` | `[left, top, right, bottom]`，文档坐标，不含效果 |
-| `nine_slice` | `{left, top, right, bottom}` 边距，或 `null` |
-| `text` | 初步文本属性（完整属性在 PS 导出时回填） |
-| `parent` | 层级里的容器名 |
+| `full_render_preview.png` | 画板**当前可见/默认状态**的合成（psd-tools，部分图层效果可能缺失）。若已有 Photoshop 导出的 `full_render.png`，审核和校验以 PS 整图为准。 |
+| `tree.json` | 图层树：`name`、`path`、`kind`、文本内容、效果摘要、`visible`（含隐藏层）、`bbox`、`layer_id`。 |
+| `crops/<layer_id>.png` | 可导出叶子（及剪贴单元）的裁切图，文件名就是 `layer_id`。隐藏层只要与画板相交且有像素也会出图。 |
+| `crops_index.json` | 每张裁切图的 id、可见性、路径、文本、效果、九宫格候选、`select_ids`。 |
+| `crops_sheet.jpg` | 所有裁切图的拼图，隐藏项标 `HID`，便于快速扫。 |
+| `nine_slice_candidates.json` | 像素启发式给出的九宫格候选（最长的均匀相邻行/列；两边边距都小于 `min_run` 则拒绝）。agent 决定采不采纳。 |
+| `materials.json` | 上述路径和数量统计。 |
 
-`dynamic_text` 与 `art_text` 按内容语义判断：
-
-- 分数、倒计时、玩家名、以及 **1–2 位**名次数字 → `dynamic_text`。三位及以上、或带前导零的数字串按名字处理，也是 `dynamic_text`，不要当成名次。
-- 固定 UI 文案（词表来自 `--rules` 的 `fixed_labels`）若带描边、渐变、投影、外发光、斜面等较重效果 → `art_text`，由 PS 栅格化，避免拼图缺字。无规则文件时，无数字且带这类效果的短标签也会判为 `art_text`。
-- 成对页签/状态里同一文案角色必须同一 `kind`。若组里任一条是 `art_text`，其余一并升为 `art_text`。导航标签与顶栏标题是不同角色，不必强行相同。角色分组的路径关键词也来自规则文件（缺省时使用通用的 `tab` / `navbar` / `topbar` 等）。
-- 审核时以 JSON 为准。
+阅读顺序建议：先看整图，理解屏幕结构；再对照 `crops_sheet.jpg` / 单张裁切图看每个零件长什么样；用 `tree.json` 把裁切图的 id 对回图层路径、可见性和文本。不要只根据图层名做决定，名称经常不准。
 
 ---
 
-## 2. 审核门闩
+## 3. 识别组件与状态
 
-推断只写 `status: "pending_review"`。必须同时给出：
+把「同一控件的不同零件、不同状态」收成组件，而不是按 PSD 分组原样切开。
 
-- 标注预览 PNG：在画板合成图上框出每条切图，写规范名和类型，九宫格画参考线。`psd-tools` 的合成可能缺效果，预览以结构核对为主。
-- manifest JSON：用户直接改这份文件（改名、改类型、改边距、删条目）。
+常见交互组件：
 
-**确认之前不要启动导出。** 确认后把 `status` 改为 `confirmed` 再跑 `.psjs`。授权测试可以在已生成预览的前提下，把自动清单视为已确认。
+- **页签 / 分段开关**（`tab_group` → 若干 `tab`）：每个页签拆成独立部件——底/背景、选中高亮、图标、文案；每个页签有自己的状态（如 `normal` / `selected`）。两个页签的开关：一组 `tab_group`，两个 `tab`，各有 normal 与 selected；选中高亮是单独资源，文案也是单独资源。
+- **底栏导航**（`navbar` → 若干 `nav_item`）：同样按项拆图标、文案、选中态，不要把整条导航烘焙成一张图。
+- **按钮、列表行、开关**：底、高亮、图标、文字分开；状态（normal / pressed / selected / disabled）分开。
 
----
+规则：
 
-## 3. 导出
-
-用 [examples/export_slices.psjs](../examples/export_slices.psjs)。脚本顶部只有一个常量 `CONFIG_URL`，指向任务目录里的作业 JSON（模板：[examples/export_config.example.json](../examples/export_config.example.json)）。不要把路径、文档名或图层 id 写进脚本；不要加额外 CLI 参数。
-
-- 只打开（或按路径复用）任务指定的那份 PSD/PSB 副本，核对 `doc.path`。用完若是脚本自己打开的，`closeWithoutSaving()`；不要覆盖保存。
-- 每条描述符 `_options.dialogOptions = "silent"`。`executeAsModal` + 顶层 `await`，对源文档 `suspendHistory`。
-- 对 `image` / `nine_slice` / `art_text`：按 `select_ids` 多选，`make` 新文档，修剪透明边，必要时把 16 位转 8 位，存 1x PNG。效果烘焙进图。重复实例各导一份，不去重。
-- 对 `dynamic_text`：只 `get` 图层，写出 `textKey` 里的内容、`fontPostScriptName`、字号、颜色（绿色字段是 `grain`）、对齐、描边等，**不出图**。
-- 同时导出目标画板的整图 PNG（`full_render.png`）供校验。若「从图层新建文档」仍是整份多画板画布，按 manifest 里的 `artboard.bounds`（文档坐标）裁切，不要裁 `0,0,w,h`（那会切到最左上角的画板）。
-- 逻辑尺寸用 `boundsNoEffects`（已核实）。`bounds` / DOM `layer.bounds` **不一定**等于含效果的可见框（有时是整份画布，或比 trim 后的不透明区域更松）。
-- 可见框必须按 trim 内缩量计算，不要把 trim 前较松的 `layer.bounds` 左上角当成 PNG 原点。从图层新建的临时文档与源画布对齐时：先记下 trim 前的 `layer.bounds`，trim 后 `layer.bounds.left/top` 是被裁掉的左边/上边像素（常为负数，如 `-5,-6`），紧致原点 = `before.left - after.left`、`before.top - after.top`，尺寸用 PNG 宽高。`slicing_helper.py build-layout` 遇到 `visible_bounds_from_trim_insets` 时不要再改回逻辑框。
-- 写 `export_log.json`（含 `done` / `ok` / `fatal` / `errs` / `docs_before` / `docs_after`），启动后轮询这份文件。
-
-然后：
-
-```text
-python slicing_helper.py build-layout ...
-```
-
-会按导出日志和 PNG 回填可见/逻辑框，并用导出图重新检测九宫格，写成布局 JSON。
+1. **不要把状态烘焙在一起。** 选中描边不要画进底图；on/off 不要合成一张。
+2. **看整图里当前显示的是哪一态**，把它标为该组件的 `default_state`。
+3. **到隐藏层里找交替状态。** 若隐藏层明显是同一控件的另一态（同样位置、成对的 on/off 文案或图标），可以纳入该组件并在导出时临时显示。隐藏层若与任何已识别组件的状态无关，忽略。
+4. **缺失的状态不要编。** 例如只有选中态、隐藏层里也没有未选中态，就在该组件的 `missing` 里写 `"normal"`，等用户确认要不要补。
+5. 底图、高亮、图标、文字始终是独立 `parts`。类型仍是 `image` | `nine_slice` | `dynamic_text` | `art_text`。可变文案（分数、名字、倒计时、1–2 位名次）用 `dynamic_text`（只出属性，不出图）；带效果的固定标签（页签名、导航名、标题）用 `art_text`（出图）。
+6. 列表重复行各导一份，不去重。全部 1x。
 
 ---
 
-## 4. 命名规则
+## 4. 命名
 
-规范名：`模块_类型_用途_状态`，全小写，下划线分隔，**禁止**直接使用 PSD 图层名。例如 `<module>_bg_item_normal`。
+规范名：`模块_类型_用途_状态`，**小写**，用下划线。不要直接复制 PSD 图层名。
 
-- **模块**：默认取画板名的拉丁 slug，或规则里的 `default_module`（通常是 `main`）。公共铬（顶栏/底栏等，路径命中 `chrome_path_keywords`）用 `chrome_module`（默认 `common`）。更多模块关键词写在规则文件的 `module_keywords`。
-- **类型**：`bg` / `btn` / `icon` / `frame` / `tab` / `item` / `deco` / `img` / `mask`。文本切图用 `img`。类型关键词、特殊图层名见规则文件。
-- **用途**：由规则词表、文本语义（分数/倒计时/名字/名次）或图层名 slug 得出。列表实例把序号编进用途（如 `item1`、`score_item2`），不去重。
-- **状态**：有才写，如 `on` / `off` / `normal` / `empty` / `full`；项目特有的状态词放在规则文件的 `state_keywords`。
+| 段 | 含义 | 例子 |
+|----|------|------|
+| 模块 | 功能模块或画板的拉丁/拼音缩写 | `main`、`shop`、`common` |
+| 类型 | 资源种类 | `bg`、`btn`、`icon`、`img`、`tab` |
+| 用途 | 这个零件干什么 | `highlight`、`title`、`home`、`avatar`、`item3` |
+| 状态 | 交互状态；默认态可写 `normal`，或在不引起歧义时省略 | `normal`、`selected`、`on`、`off` |
 
-重名时追加 `_2`、`_3`。映射不到就用稳定的 `l{layer_id}` 兜底，仍然不要回退成原始图层名。
-
----
-
-## 5. 九宫格启发式
-
-对候选图（最小边 ≥ 48px）做像素分析：在相邻列/行里找最长的「几乎相同」连续区段（默认容差 `tol=1`，最短 8px），把这段当作可拉伸区，四边剩下的就是边距 `{left, top, right, bottom}`（对应圆角、描边、不可拉伸的边）。
-
-拒绝以下情况：没有足够长的均匀段、拉伸后中心几乎没了、或四边距都小于 8px（接近铺满的纯色会被误判成 1px 边）。小图标不要标成 `nine_slice`。
-
-推断阶段用 `psd-tools` 合成（可能缺效果，渐变需要 scipy）。导出后再用 PS 的 1x PNG 重测，并写进布局 JSON。审核时可改边距。
+同一组件下，不同状态的同一零件应共用前三段、只改状态段，例如 `main_tab_left_normal` 与 `main_tab_left_selected`。可选的 `--rules` / [naming_rules.example.json](../examples/naming_rules.example.json) 只提供项目用词习惯（模块词、固定标签等），供 agent 参考，不是自动分类器。
 
 ---
 
-## 6. 布局 JSON schema（`psjs-layout/v1`）
+## 5. Manifest schema（`psjs-slice-manifest/v2`）
 
-引擎无关的中间格式，坐标是**画板坐标系**、1x 像素。不包含任何引擎导入器。
+Agent 编写的清单顶层如下。`flatten` 会根据 `components` 生成 `entries`（导出用的扁平列表），不要手写 entries 作为主源。若清单里带上 `layer_tree`（`prepare` 写出的图层树），`flatten` 和 `build-layout` 会按 PSD 自下而上的绘制顺序排列条目；默认状态校验的 src-over 拼图依赖这个顺序，顺序不对会明显拉低 PSNR。
 
 ```json
 {
-  "schema": "psjs-layout/v1",
+  "schema": "psjs-slice-manifest/v2",
+  "status": "pending_review",
   "source": {
     "file": "design.psb",
-    "doc_size": [2400, 1600],
-    "artboard": {
-      "id": 1001,
-      "name": "Board_Main",
-      "bounds": [0, 0, 1080, 1920],
-      "size": [1080, 1920]
-    }
+    "doc_size": [1080, 1920],
+    "artboard": { "id": 100, "name": "screen", "bounds": [0, 0, 1080, 1920], "size": [1080, 1920] }
   },
-  "nodes": [
-    {
-      "id": "main_bg_item_normal",
-      "name": "main_bg_item_normal",
-      "kind": "nine_slice",
-      "layer_id": 2002,
-      "select_ids": [2002],
-      "parent": "group_main_item_list_1",
-      "source_name": "panel",
-      "source_path": "Board_Main/list/list 1/panel",
-      "visible_bounds": {"left": 14, "top": 512, "right": 1076, "bottom": 734},
-      "logical_bounds": {"left": 14, "top": 523, "right": 1064, "bottom": 723},
-      "anchor": {"x": 539, "y": 623},
-      "pivot": {"x": 0.5, "y": 0.5},
-      "nine_slice": {"left": 30, "top": 30, "right": 29, "bottom": 29},
-      "image": "main_bg_item_normal.png",
-      "text": null
-    }
-  ]
+  "components": [],
+  "missing": [],
+  "notes": []
 }
 ```
 
-- `visible_bounds`：含图层效果的可见像素框。
-- `logical_bounds`：不含效果（来自 `boundsNoEffects`，缺则回退 `psd-tools` bbox）。
-- `anchor`：逻辑框中心（画板坐标）。`pivot`：归一化到逻辑框，默认 `(0.5, 0.5)`。
-- `dynamic_text` 的 `image` 为 `null`，属性放在 `text`（`content`、`font`、`size`、`color`、`alignment`、`stroke` 等）。
-- 层级见 `tree` / `parent`。
+组件节点常用字段：
 
-manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `status`、`naming_rule`、`review_gate`。
+| 字段 | 含义 |
+|------|------|
+| `id` | 稳定 id，用于布局和状态预览文件名，如 `main_tab_group` |
+| `type` | `screen`、`tab_group`、`tab`、`navbar`、`nav_item`、`list_item`、`button` 等 |
+| `name` | 规范名或语义名 |
+| `default_state` | PSD **当前显示**的状态名 |
+| `parts` | 不属于某一状态、始终存在的部件（如共享底图） |
+| `states.<state>.parts` | 该状态下的部件 |
+| `states.<state>.from_hidden` | 这些部件来自隐藏层时为 `true` |
+| `missing` | 该组件应该有、但 PSD 里完全没画的状态名 |
+| `children` | 子组件 |
+| `source_path` / `layer_id` | 仅供对照的源图层引用 |
+
+部件（`part`）常用字段：`name`（规范文件名）、`role`（`base`、`highlight`、`icon`、`text` 等）、`kind`、`layer_id`、`select_ids`、`hidden`、`nine_slice`、`text`、`logical_bounds`、`source_name`、`source_path`。
+
+`dynamic_text` 的 `text` 在导出时由 Photoshop 补全（内容、字体 PostScript 名、字号、颜色、描边、对齐、`click_point` 为相对整份文档的百分比）。
+
+### 5.1 示例：双页签开关 + 底栏导航
+
+下面是一份**虚构**界面，不要把它当成某个项目的图层名。屏幕当前显示：左侧页签选中、底栏第一项选中。隐藏层里有右侧页签的选中文案、左侧页签的未选中文案，以及底栏第二项的选中图标。右侧页签没有单独的未选中高亮（高亮是共享资源）。没有任何层画出「第三导航项」，所以它只能出现在 `missing` 里。
+
+```json
+{
+  "schema": "psjs-slice-manifest/v2",
+  "status": "pending_review",
+  "components": [
+    {
+      "id": "main_screen",
+      "type": "screen",
+      "name": "main_screen",
+      "children": [
+        {
+          "id": "main_tab_group",
+          "type": "tab_group",
+          "name": "main_tab_group",
+          "default_state": "left",
+          "parts": [
+            {
+              "name": "main_tab_highlight_selected",
+              "role": "highlight",
+              "kind": "nine_slice",
+              "layer_id": 201,
+              "select_ids": [201],
+              "hidden": false,
+              "source_name": "tab highlight",
+              "source_path": "tabs/highlight"
+            }
+          ],
+          "children": [
+            {
+              "id": "main_tab_left",
+              "type": "tab",
+              "name": "main_tab_left",
+              "default_state": "selected",
+              "states": {
+                "selected": {
+                  "from_hidden": false,
+                  "parts": [
+                    {
+                      "name": "main_tab_left_selected",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 211,
+                      "hidden": false,
+                      "source_name": "Left on"
+                    }
+                  ]
+                },
+                "normal": {
+                  "from_hidden": true,
+                  "parts": [
+                    {
+                      "name": "main_tab_left_normal",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 212,
+                      "hidden": true,
+                      "source_name": "Left off"
+                    }
+                  ]
+                }
+              },
+              "missing": []
+            },
+            {
+              "id": "main_tab_right",
+              "type": "tab",
+              "name": "main_tab_right",
+              "default_state": "normal",
+              "states": {
+                "normal": {
+                  "from_hidden": false,
+                  "parts": [
+                    {
+                      "name": "main_tab_right_normal",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 221,
+                      "hidden": false,
+                      "source_name": "Right off"
+                    }
+                  ]
+                },
+                "selected": {
+                  "from_hidden": true,
+                  "parts": [
+                    {
+                      "name": "main_tab_right_selected",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 222,
+                      "hidden": true,
+                      "source_name": "Right on"
+                    }
+                  ]
+                }
+              },
+              "missing": []
+            }
+          ]
+        },
+        {
+          "id": "main_navbar",
+          "type": "navbar",
+          "name": "main_navbar",
+          "default_state": "home",
+          "parts": [
+            {
+              "name": "main_bg_navbar",
+              "role": "base",
+              "kind": "nine_slice",
+              "layer_id": 301,
+              "hidden": false,
+              "source_name": "nav bg"
+            }
+          ],
+          "children": [
+            {
+              "id": "main_nav_home",
+              "type": "nav_item",
+              "name": "main_nav_home",
+              "default_state": "selected",
+              "states": {
+                "selected": {
+                  "from_hidden": false,
+                  "parts": [
+                    {
+                      "name": "main_icon_home_selected",
+                      "role": "icon",
+                      "kind": "image",
+                      "layer_id": 311,
+                      "hidden": false
+                    },
+                    {
+                      "name": "main_img_home_selected",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 312,
+                      "hidden": false
+                    }
+                  ]
+                }
+              },
+              "missing": ["normal"]
+            },
+            {
+              "id": "main_nav_shop",
+              "type": "nav_item",
+              "name": "main_nav_shop",
+              "default_state": "normal",
+              "states": {
+                "normal": {
+                  "from_hidden": false,
+                  "parts": [
+                    {
+                      "name": "main_icon_shop_normal",
+                      "role": "icon",
+                      "kind": "image",
+                      "layer_id": 321,
+                      "hidden": false
+                    },
+                    {
+                      "name": "main_img_shop_normal",
+                      "role": "text",
+                      "kind": "art_text",
+                      "layer_id": 322,
+                      "hidden": false
+                    }
+                  ]
+                },
+                "selected": {
+                  "from_hidden": true,
+                  "parts": [
+                    {
+                      "name": "main_icon_shop_selected",
+                      "role": "icon",
+                      "kind": "image",
+                      "layer_id": 323,
+                      "hidden": true
+                    }
+                  ]
+                }
+              },
+              "missing": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "missing": []
+}
+```
+
+要点：高亮是 `tab_group` 上的共享部件，没有和某个页签的文案烤在一起。`main_nav_home` 在隐藏层里找不到未选中图标或文案，所以 `missing` 为 `["normal"]`，等待用户确认；不要凭空画一个。`flatten` 之后，隐藏部件会带 `hidden: true`，导出脚本会临时显示再恢复。
 
 ---
 
-## 7. 校验
+## 6. 审核门闩
 
-`validate` 会：
+确认前不要导出。
 
-1. 按 `visible_bounds` 和 z 序把非 `dynamic_text` 的 PNG 用 **src-over**（`Image.alpha_composite`，不是 `paste+mask`）拼回画板大小的画布。不模拟 PS 混合模式。
-2. 另外用 Pillow 按导出的文本属性把 `dynamic_text` 画进拼图（`--fonts-dir` 有对应 TTF/OTF 时用原字体）。`click_point` 是相对整份文档的百分比，需换算到画板坐标；字号已含 `transform.yy`。Pillow 不能复现 PS 的 hinting、外描边位置和图层样式，文字区仍会有残差。
-3. 与 PS 整图对比，**同时报告两组数字**：`diff_text_rendered`（拼图含 Pillow 文字）和 `diff_text_masked`（不画动态文字，并遮罩其框）。指标：通道 MAE、PSNR、像素差占比（最大通道差 >16 / >48），CIEDE2000 的 mean / p95 / 占比（ΔE>2、ΔE>5）。
-4. 按每条切图的可见框计算误差，报告 mean ΔE 最差的 10 条（文字渲染版与遮罩版各一份）。
-5. 检查漏切（manifest 有条目但没有 PNG）、重名、空图（尺寸为 0 或 alpha 全 0）。`dynamic_text` 检查是否写出了文本属性。
-6. 写出 `recomposite.png`（含文字）、`recomposite_text_masked.png`、`validate_side_by_side.jpg`、`validate_side_by_side_masked.jpg`、`validate_report.json`。
-
-页签、底栏等重叠层按普通 src-over 叠放也会和 PS 的混合结果有差，这是预期限制，不是漏切。
+1. 用 `flatten` 把组件树展成 `entries`，再用 `preview` 画标注预览（框出每个切图、标规范名和九宫格线；来自隐藏态的条目会计入标题）。
+2. 把 `preview_annotated.png` 和 `manifest.json` 交给用户。用户改 JSON：改名、改类型、改九宫格、拆/合并部件、确认或删除 `missing`、把不该导出的隐藏层拿掉。
+3. `status` 在用户确认前保持 `pending_review`，确认后改为 `confirmed`。导出脚本拒绝其它状态（测试授权下允许 `pending_review`）。
+4. 用户确认后才进入导出。
 
 ---
 
-## 8. 实测（Windows / Photoshop 2026）
+## 7. 导出
+
+[examples/export_slices.psjs](../examples/export_slices.psjs) 只硬编码一个 `CONFIG_URL`，从作业 JSON 读路径（见 [export_config.example.json](../examples/export_config.example.json)）。按 `layer_id`（及 `select_ids` 里的剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份。`dynamic_text` 不出图，只写文本属性；`art_text` 出图。
+
+若条目 `hidden`（或 `from_hidden`）为真，脚本先显示该层及其被隐藏的祖先，再「从图层新建」、trim、保存，然后把可见性改回去。整次作业在 `suspendHistory` 里进行；脚本自己打开的文档一律 `closeWithoutSaving`。每条描述符 `_options.dialogOptions = "silent"`。只操作作业打开的文档，绝不改、存、关用户已打开的其它文档。
+
+可见框记录规则不变：临时文档与源画布对齐时，紧致可见原点 = trim 前 `layer.bounds.left/top` 减 trim 后的 left/top。不要把 trim 前的松框左上角当成 PNG 原点。
+
+---
+
+## 8. 布局 JSON schema（`psjs-layout/v2`）
+
+层级按**组件语义**重组，例如 `screen > tab_group > tab > state > part`。源图层的 `layer_id`、`source_name`、`source_path` 只作对照，不是树的结构依据。
+
+顶层：
+
+```json
+{
+  "schema": "psjs-layout/v2",
+  "source": { "artboard": { "id": 100, "name": "screen", "bounds": [0, 0, 1080, 1920], "size": [1080, 1920] } },
+  "components": [],
+  "nodes": [],
+  "missing": [],
+  "notes": []
+}
+```
+
+- `components`：与 manifest 相同的语义树，但每个 part 已补上导出后的 `image`、`visible_bounds`、`logical_bounds`、`nine_slice`、文本属性。
+- `nodes`：扁平列表，便于引擎遍历和校验放置。每条含 `name`、`kind`、`component_id`、`part_role`、`state`、`default`、`hidden`、`visible_bounds`（含效果，画板坐标）、`logical_bounds`（不含效果）、`anchor`（逻辑框中心）、`pivot`（0.5, 0.5）、`nine_slice`、`image`、`text`。
+- 坐标是画板像素（1x）。各引擎导入器自己写，不在本 skill 里。
+
+`tab_group` / `navbar` 默认视为互斥：预览某个子项的 `selected` 时，兄弟项改用 `normal`（或 `off`）。
+
+---
+
+## 9. 校验
+
+1. **默认状态**：只拼 `default: true` 的部件（即 PSD 里当前显示的那一态，加上始终可见的 chrome），用 src-over（`Image.alpha_composite`）叠回画板，与 Photoshop 整图比像素差 / CIEDE2000 ΔE。同时报告 Pillow 渲染动态文字后的数字、以及遮罩动态文字区域后的数字，并列出误差最大的 10 条。再检查漏切、重名、空图。
+2. **交替状态**：对每个交互组件的非默认状态，按互斥规则替换对应部件，写出 `validate/states/<component_id>_<state>.png`，供目视检查。这些预览**不**和默认态整图比 PSNR（对不上是正常的）。
+
+`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。Pillow 无法复现 PS 的混合模式、文字 hinting 和描边，遮罩后若残差集中在重叠层或文字本身，属于预期。
+
+---
+
+## 10. 实测（Windows / Photoshop 2026）
 
 对象：一份多画板 UI PSB 的**副本**（未改、未保存、未关闭用户可能打开的原文档或其它未指定文档）。实测画板是一个 1080×2340 的列表界面，65 个可见元素。时间均为 Asia/Shanghai（UTC+8）。项目词表不进技能仓库，回归时用仓库外的 `--rules` 文件。
 
-### 8.1 第一轮（修前）
+### 10.1 第一轮（修前）
 
 | 步骤 | 结果 |
 |------|------|
@@ -186,7 +401,7 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 
 描边残差的根因（已用逐条 best-fit 和一次 PS probe 核实，不是色管、JPEG 或预乘）：「从图层新建」得到的临时文档与源画布对齐，DOM `layer.bounds` 比 trim 后的不透明区域更松。第一轮把这个较松框的左上角当成 PNG 原点，没有加上被 trim 掉的左边/上边像素。trim 后 `layer.bounds.left/top` 是内缩量（常为负数，如 `-5,-6`）。紧致原点 = `before.left - after.left`。不透明像素（A≥250）在正确原点上与 PS 整图完全重合（mae=0）。偏移不是全局 +2,+2：有的切图约 (0,+2)，有的约 (+5,+6) 或 (+3,+4)，卡片/美术字约 (+2,+2)。
 
-### 8.2 第二轮（修后重跑，同副本）
+### 10.2 第二轮（修后重跑，同副本）
 
 | 步骤 | 结果 |
 |------|------|
@@ -210,9 +425,9 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 
 Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、名字、名次），来自 Pillow 无法复现 PS 的 hinting、字框锚点和外描边，不是切图错位。遮罩后残留的 >16 差像素共 3429 个（约占遮罩后像素的 0.15%），几乎都叠在底栏、导航按钮与末行列表底板等重叠层。这是普通 src-over 不模拟 PS 混合模式造成的，属预期残差，不是漏切或原点错误。
 
-### 8.3 规则文件外置后的回归（同副本）
+### 10.3 规则文件外置后的回归（同副本）
 
-项目词表放在仓库外的 `--rules` JSON（不进技能仓库）。带规则完整重跑：推断 65 条（约 25.8 秒，16:11:01–16:11:28），类型与 8.2 相同（导出后 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4）；导出 65/65 成功、43 张 PNG（16:11:56–16:12:39，约 42.4 秒）；校验约 10.6 秒，漏切/重名/空图为 0。遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 8.2 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。`docs_before` / `docs_after` 为空。
+项目词表放在仓库外的 `--rules` JSON（不进技能仓库）。带规则完整重跑：推断 65 条（约 25.8 秒，16:11:01–16:11:28），类型与 8.2 相同（导出后 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4）；导出 65/65 成功、43 张 PNG（16:11:56–16:12:39，约 42.4 秒）；校验约 10.6 秒，漏切/重名/空图为 0。遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 10.2 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。`docs_before` / `docs_after` 为空。
 
 不传 `--rules` 时，对同一画板只跑推断也成功，且 **kind 完全一致**（同样 22 条动态文字、4 条美术字），说明分类核心不依赖项目词表。规范名则更泛化：画板名无法拉丁化时模块落在 `main`，奖牌/头像等缺少用途词，只能编成 `item1_3` 这类序号。举例（带规则 → 无规则）：
 
@@ -231,3 +446,18 @@ Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、�
 - 16 位文档导出前需转 8 位（trim 前就转，使内缩量与导出 PNG 一致）。
 - `psd-tools` 1.26 默认 `max_objects=1_000_000`，大 PSB 会超限；渐变九宫格分析需要 scipy。
 - 校验拼图用 `Image.alpha_composite`（src-over）。`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。
+
+### 10.4 Agent 驱动的组件 / 状态切图（同副本）
+
+改成「助手只准备材料，agent 看图写清单」后再跑同一份列表界面副本、同一块 1080×2340 画板。时间均为 Asia/Shanghai（UTC+8）。
+
+| 步骤 | 结果 |
+|------|------|
+| 准备材料 | `prepare` 约 25.3 秒。图层树含隐藏层；裁切图 169 张，其中 50 张来自隐藏层或隐藏祖先下的层（psd-tools 需临时打开祖先可见性才能合成出像素，只改内存、不写回 PSD）。 |
+| Agent 清单 | 同时阅读整图、裁切图和图层树后编写 v2 manifest，不是关键词推断。交互组件按状态拆开，隐藏的交替状态纳入，无关隐藏层忽略。`flatten` 后 75 条（默认态 65，隐藏态 10）。默认态类型与 10.2 / 10.3 相同：image 18 / nine_slice 21 / dynamic_text 22 / art_text 4。 |
+| 双页签开关 | `tab_group` 下两个 `tab`。默认：右侧页签为 selected（高亮 + 美术字），左侧为 normal（未选中高亮 + 美术字）。隐藏层里找到了右侧的 normal（高亮 + 文案）和左侧的 selected（高亮 + 文案），均已导出。没有缺失的页签状态。共享底槽与中缝是 group 级部件。预留的第三页签组与其它废弃页签组忽略。 |
+| 底栏导航 | `navbar` 下三个 `nav_item`。默认：右侧为 selected（槽、图标、标签），中、左为 normal（槽 + 图标，无标签）。来自隐藏层：中间项的 selected 标签；右侧项的 normal 槽与图标；以及一层 selected 高亮（在默认 selected 下仍是隐藏的，只导出、不进入默认拼图）。左侧项在可见层和隐藏层里都没有 selected 态，写入该组件 `missing: ["selected"]`，未捏造。隐藏祖先下的锁图标与其它预留锁忽略。 |
+| 审核 / 导出 | 已写标注预览。测试中将 agent 清单视为已确认（`pending_review`）。导出 75/75 成功（约 57 秒，16:39:18–16:40:16）；10 条隐藏态均临时显示后恢复。脚本打开副本后不保存关闭；`docs_before` / `docs_after` 为空。 |
+| 校验 | 约 12.7 秒。漏切 / 重名 / 空图：0。按 PSD 绘制顺序拼默认态后，遮罩动态文字：MAE 0.076，PSNR **46.24 dB**，mean ΔE **0.047**（与 10.2 / 10.3 一致）。Pillow 文字全图：PSNR 23.39 dB，mean ΔE 1.041。另写出 4 张交替状态预览（右侧页签 normal、左侧页签 selected、中间导航 selected、右侧导航 normal），只供目视，不和默认整图比 PSNR。 |
+
+要点：默认态数字要和以前对齐，清单条目必须按 PSD 自下而上的顺序绘制；`flatten` / `build-layout` 在提供 `layer_tree` 时会排这个序。顺序不对时（例如把页签中缝画在高亮下面），遮罩 PSNR 会掉到约 38 dB。

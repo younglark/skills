@@ -5,14 +5,16 @@
 Requires: psd-tools, Pillow, numpy
 
 Subcommands:
-  infer       Read a PSD/PSB with psd-tools and write manifest JSON + annotated preview.
-              Optional --artboard <name or id>; optional --rules naming JSON.
+  prepare     Build agent materials: full-render preview, per-layer crops, layer tree, nine-slice candidates.
+  flatten     Turn an agent-written component manifest into a flat export entry list.
+  infer       Optional keyword draft only (draft_manifest.json); the agent must review or replace it.
   preview     Redraw the annotated preview from a (possibly edited) manifest.
   build-layout  Merge confirmed manifest + Photoshop export log + PNGs into layout JSON.
-  validate    Recomposite slices from layout metadata and compare with a full PS render.
+  validate    Recomposite the default state vs a full PS render; also render alternate states.
 
-Visible layers only. Hidden layers are ignored entirely. Normalized names follow
-模块_类型_用途_状态 and never copy the raw PSD layer name.
+The helper prepares materials. An agent writes the manifest (components, parts,
+states, names). Hidden layers appear in the tree and crops so the agent can
+attach them to interactive states. Unrelated hidden layers stay unused.
 """
 from __future__ import annotations
 
@@ -37,8 +39,10 @@ try:
 except ImportError:
     ParseLimits = None
 
-SCHEMA_MANIFEST = "psjs-slice-manifest/v1"
-SCHEMA_LAYOUT = "psjs-layout/v1"
+SCHEMA_MANIFEST = "psjs-slice-manifest/v2"
+SCHEMA_LAYOUT = "psjs-layout/v2"
+SCHEMA_MANIFEST_V1 = "psjs-slice-manifest/v1"
+SCHEMA_LAYOUT_V1 = "psjs-layout/v1"
 
 KIND_COLORS = {
     "image": (0, 170, 255),
@@ -141,8 +145,8 @@ def collect_layer(layer, path, depth, index_in_parent, warnings):
             node["text"] = str(text) if text is not None else None
         except Exception as exc:
             warnings.append(f"text unreadable {node['path']}: {exc}")
-    if is_group(layer) and visible:
-        # Hidden groups are ignored entirely: do not walk their children.
+    if is_group(layer):
+        # Walk hidden groups too: the agent needs hidden state layers in the tree.
         for i, child in enumerate(layer):
             node["children"].append(collect_layer(child, path + [name], depth + 1, i, warnings))
     return node
@@ -663,12 +667,52 @@ def detect_nine_slice(image, min_run=8, tol=1.0, min_side=48):
     return {"left": int(left), "top": int(top), "right": int(right), "bottom": int(bottom)}
 
 
-def try_composite(node, warnings):
+def _visibility_chain(layer):
+    chain = []
+    current = layer
+    while current is not None:
+        chain.append(current)
+        current = getattr(current, "parent", None)
+    return chain
+
+
+def try_composite(node, warnings, force=None):
+    """Rasterize one layer. Hidden layers (or visible layers under a hidden
+    ancestor) need the ancestor chain temporarily shown; psd-tools otherwise
+    returns a fully transparent image. Visibility is always restored. The PSD
+    file is never written.
+    """
     layer = node.get("_layer")
     if layer is None:
         return None
+    if force is None:
+        force = not bool(node.get("visible", True))
+    saved = []
     try:
-        image = layer.composite()
+        if force:
+            for item in _visibility_chain(layer):
+                try:
+                    current = item.visible
+                except Exception:
+                    continue
+                if current is not False:
+                    continue
+                try:
+                    item.visible = True
+                    saved.append((item, False))
+                except Exception:
+                    pass
+        try:
+            image = layer.composite(force=True) if force else layer.composite()
+        except TypeError:
+            image = layer.composite()
+        if image is None:
+            topil = getattr(layer, "topil", None)
+            if callable(topil):
+                try:
+                    image = topil()
+                except Exception:
+                    image = None
         if image is None:
             return None
         if image.mode != "RGBA":
@@ -677,6 +721,12 @@ def try_composite(node, warnings):
     except Exception as exc:
         warnings.append(f"composite failed {node.get('path')}: {exc}")
         return None
+    finally:
+        for item, value in saved:
+            try:
+                item.visible = value
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1062,462 @@ def strip_runtime(entries):
     return clean
 
 
+def all_children(node):
+    return list(node.get("children") or [])
+
+
+def descendant_ids(node, include_hidden=True):
+    ids = []
+    if not include_hidden and not node.get("visible"):
+        return ids
+    if node.get("layer_id") is not None:
+        ids.append(node["layer_id"])
+    for child in all_children(node):
+        ids.extend(descendant_ids(child, include_hidden=include_hidden))
+    return ids
+
+
+def strip_tree(node):
+    if not node:
+        return None
+    out = {k: v for k, v in node.items() if not k.startswith("_") and k != "children"}
+    out["children"] = [strip_tree(c) for c in (node.get("children") or [])]
+    return out
+
+
+def bbox_intersects(a, b):
+    if not a or not b or len(a) < 4 or len(b) < 4:
+        return False
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def iter_exportable_nodes(node, include_hidden=True):
+    """Yield (base, clipped_list) for leaves and non-descended clip units."""
+    kids = all_children(node)
+    if not kids:
+        if node.get("is_adjustment"):
+            return
+        if node.get("is_artboard"):
+            return
+        if (node.get("width") or 0) <= 0 or (node.get("height") or 0) <= 0:
+            return
+        if include_hidden or node.get("visible"):
+            yield node, []
+        return
+    units = attach_clips(kids)
+    for unit in units:
+        base, clipped = unit["base"], unit["clipped"]
+        if base is None:
+            for c in clipped:
+                if include_hidden or c.get("visible"):
+                    yield from iter_exportable_nodes(c, include_hidden)
+            continue
+        if not include_hidden and not base.get("visible"):
+            continue
+        # Groups with children are opened so parts stay independent.
+        if base.get("is_group") and all_children(base) and not base.get("is_text"):
+            yield from iter_exportable_nodes(base, include_hidden)
+            for c in clipped:
+                if include_hidden or c.get("visible"):
+                    yield from iter_exportable_nodes(c, include_hidden)
+            continue
+        clips = [c for c in clipped if include_hidden or c.get("visible")]
+        yield base, clips
+
+
+def public_crop_name(layer_id):
+    return f"{int(layer_id)}.png"
+
+
+def write_crop_sheet(items, out_path, thumb=160, cols=8):
+    """Contact sheet of crops with id / visibility labels (agent overview)."""
+    if not items:
+        return None
+    font = load_font(13)
+    font_sm = load_font(11)
+    rows = (len(items) + cols - 1) // cols
+    cell_w, cell_h = thumb + 8, thumb + 36
+    sheet = Image.new("RGB", (cols * cell_w + 8, rows * cell_h + 8), (30, 30, 30))
+    draw = ImageDraw.Draw(sheet)
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    for i, item in enumerate(items):
+        r, c = divmod(i, cols)
+        x, y = 8 + c * cell_w, 8 + r * cell_h
+        path = item.get("path")
+        if path and Path(path).exists():
+            try:
+                im = Image.open(path).convert("RGBA")
+                im.thumbnail((thumb, thumb), resampling)
+                bg = Image.new("RGBA", (thumb, thumb), (40, 40, 40, 255))
+                ox = (thumb - im.width) // 2
+                oy = (thumb - im.height) // 2
+                bg.paste(im, (ox, oy), im)
+                sheet.paste(bg.convert("RGB"), (x, y))
+            except Exception:
+                draw.rectangle([x, y, x + thumb, y + thumb], fill=(60, 40, 40))
+        flag = "HID" if not item.get("visible") else "vis"
+        label = f"{item.get('layer_id')} {flag}"
+        draw.text((x, y + thumb + 2), label, fill=(255, 220, 80) if flag == "HID" else (200, 200, 200), font=font_sm)
+        name = (item.get("name") or "")[:18]
+        draw.text((x, y + thumb + 16), name, fill=(180, 180, 180), font=font_sm)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path, quality=85)
+    return out_path
+
+
+def open_psd(psd_path, warnings=None):
+    if PSDImage is None:
+        raise SystemExit("psd-tools is required (pip install psd-tools)")
+    psd_path = Path(psd_path)
+    open_kwargs = {}
+    if ParseLimits is not None:
+        open_kwargs["parse_limits"] = ParseLimits(
+            max_objects=None, max_total_bytes=None, max_read_bytes=None
+        )
+    return PSDImage.open(str(psd_path), **open_kwargs)
+
+
+def walk_document(psd):
+    warnings = []
+    roots = []
+    for i, layer in enumerate(psd):
+        roots.append(collect_layer(layer, [], 1, i, warnings))
+    return roots, warnings
+
+
+def prepare_target(target, psd, psd_path, dest: Path, time_base, warnings):
+    dest.mkdir(parents=True, exist_ok=True)
+    bbox = target.get("bbox") or [0, 0, target["width"], target["height"]]
+    art_w, art_h = target["width"], target["height"]
+    print(
+        f"target {target.get('name')} id={target.get('layer_id')} {art_w}x{art_h} bbox={bbox}",
+        flush=True,
+    )
+    tree = strip_tree(target)
+    tree_path = dest / "tree.json"
+    tree_doc = {
+        "source": {
+            "file": str(psd_path),
+            "doc_size": [int(psd.width), int(psd.height)],
+            "color_mode": enum_val(getattr(psd, "color_mode", None)),
+            "depth": getattr(psd, "depth", None),
+            "artboard": {
+                "id": target.get("layer_id"),
+                "name": target.get("name"),
+                "bounds": bbox,
+                "size": [art_w, art_h],
+            },
+        },
+        "tree": tree,
+        "notes": [
+            "Includes hidden layers. Visibility is in each node's visible flag.",
+            "The agent uses this tree with the full-render preview and crops to write the manifest.",
+            "Do not copy raw PSD layer names into export file names.",
+        ],
+    }
+    tree_path.write_text(json.dumps(tree_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    t3 = time.time()
+    preview_base = artboard_image(target, warnings)
+    print(f"artboard composite in {time.time()-t3:.1f}s size={preview_base.size}", flush=True)
+    render_path = dest / "full_render_preview.png"
+    preview_base.convert("RGB").save(render_path, "PNG")
+
+    crops_dir = dest / "crops"
+    if crops_dir.exists():
+        for old in crops_dir.glob("*.png"):
+            try:
+                old.unlink()
+            except Exception:
+                pass
+    crops_dir.mkdir(parents=True, exist_ok=True)
+
+    crop_records = []
+    nine_candidates = []
+    t4 = time.time()
+    units = list(iter_exportable_nodes(target, include_hidden=True))
+    for base, clipped in units:
+        if not bbox_intersects(base.get("bbox"), bbox) and not any(
+            bbox_intersects(c.get("bbox"), bbox) for c in clipped
+        ):
+            continue
+        lid = base.get("layer_id")
+        if lid is None:
+            continue
+        image = try_composite(base, warnings, force=True)
+        if image is None or image.size[0] <= 0 or image.size[1] <= 0:
+            continue
+        arr = __import__("numpy").asarray(image)
+        if arr.size == 0 or int(arr[..., 3].max()) == 0:
+            continue
+        out_png = crops_dir / public_crop_name(lid)
+        image.save(out_png, "PNG")
+        nine = None
+        if not base.get("is_text"):
+            nine = detect_nine_slice(image)
+        rec = {
+            "layer_id": lid,
+            "name": base.get("name") or "",
+            "path": base.get("source_path") or base.get("path") or "",
+            "kind": base.get("kind"),
+            "is_text": bool(base.get("is_text")),
+            "text": base.get("text"),
+            "effects": list(base.get("effects") or []),
+            "visible": bool(base.get("visible")),
+            "clipping": bool(base.get("clipping")),
+            "opacity": base.get("opacity"),
+            "blend_mode": base.get("blend_mode"),
+            "bbox": base.get("bbox"),
+            "size": list(image.size),
+            "select_ids": [lid] + [c["layer_id"] for c in clipped if c.get("layer_id") is not None],
+            "clipped_ids": [c["layer_id"] for c in clipped if c.get("layer_id") is not None],
+            "crop": f"crops/{public_crop_name(lid)}",
+            "path": base.get("path") or "",
+            "nine_slice": nine,
+        }
+        # fix duplicate path key — keep source path
+        rec["path"] = base.get("path") or ""
+        crop_records.append(rec)
+        if nine:
+            nine_candidates.append({
+                "layer_id": lid,
+                "name": rec["name"],
+                "path": rec["path"],
+                "nine_slice": nine,
+                "crop": rec["crop"],
+            })
+    print(f"wrote {len(crop_records)} crops in {time.time()-t4:.1f}s", flush=True)
+    (dest / "crops_index.json").write_text(
+        json.dumps({"count": len(crop_records), "crops": crop_records}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (dest / "nine_slice_candidates.json").write_text(
+        json.dumps({"count": len(nine_candidates), "candidates": nine_candidates}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    sheet_items = []
+    for rec in crop_records:
+        sheet_items.append({
+            "layer_id": rec["layer_id"],
+            "name": rec["name"],
+            "visible": rec["visible"],
+            "path": dest / rec["crop"],
+        })
+    sheet_path = dest / "crops_sheet.jpg"
+    write_crop_sheet(sheet_items, sheet_path)
+    hidden_n = sum(1 for r in crop_records if not r["visible"])
+    text_n = sum(1 for r in crop_records if r.get("is_text"))
+    materials = {
+        "source": tree_doc["source"],
+        "full_render_preview": str(render_path),
+        "tree": str(tree_path),
+        "crops_dir": str(crops_dir),
+        "crops_index": str(dest / "crops_index.json"),
+        "crops_sheet": str(sheet_path),
+        "nine_slice_candidates": str(dest / "nine_slice_candidates.json"),
+        "stats": {
+            "crop_count": len(crop_records),
+            "hidden_crops": hidden_n,
+            "text_crops": text_n,
+            "nine_slice_candidates": len(nine_candidates),
+            "visible_nodes": sum(1 for r in crop_records if r["visible"]),
+            "prepare_sec": round(time.time() - time_base, 2),
+        },
+        "notes": [
+            "Look at full_render_preview.png (visible/default state; psd-tools may omit some layer effects),",
+            "the crops (filename is layer_id), crops_sheet.jpg, and tree.json together.",
+            "Then write manifest.json with components / parts / states. Hidden crops are candidates for alternate states.",
+            "Do not copy raw PSD layer names. Naming is 模块_类型_用途_状态, lowercase.",
+        ],
+    }
+    (dest / "materials.json").write_text(json.dumps(materials, ensure_ascii=False, indent=2), encoding="utf-8")
+    return materials
+
+
+def cmd_prepare(args):
+    t0 = time.time()
+    psd_path = Path(args.psd)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"opening {psd_path} ({psd_path.stat().st_size} bytes)", flush=True)
+    psd = open_psd(psd_path)
+    print(f"opened in {time.time()-t0:.1f}s: {psd.width}x{psd.height}", flush=True)
+    t1 = time.time()
+    roots, warnings = walk_document(psd)
+    print(f"tree walked in {time.time()-t1:.1f}s, top-level {len(roots)}", flush=True)
+    targets = select_targets(roots, args.artboard, psd=psd)
+    if args.artboard:
+        hidden = [t for t in targets if not t.get("visible")]
+        if hidden:
+            raise SystemExit(f"artboard is hidden: {hidden[0].get('name')}")
+    targets = [t for t in targets if t.get("visible")]
+    if not targets:
+        raise SystemExit("no visible artboard or canvas target")
+
+    slug_used = set()
+    if len(targets) == 1:
+        result = prepare_target(targets[0], psd, psd_path, out_dir, t0, warnings)
+        result["warnings"] = warnings
+        print(json.dumps({k: v for k, v in result.items() if k != "notes"} | {"notes": result.get("notes"), "warning_count": len(warnings)}, ensure_ascii=False, indent=2))
+        return 0
+    index = []
+    for target in targets:
+        slug = target_slug(target, slug_used)
+        dest = out_dir / slug
+        item = prepare_target(target, psd, psd_path, dest, time.time(), warnings)
+        item["out_dir"] = str(dest)
+        item["slug"] = slug
+        index.append({k: v for k, v in item.items() if k != "notes"})
+    payload = {"targets": index, "count": len(index)}
+    (out_dir / "index.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"index": str(out_dir / "index.json"), **payload}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def iter_component_parts(component, ancestors=None):
+    """Yield (component, state_name or None, state_obj or None, part) for every part."""
+    ancestors = ancestors or []
+    for part in component.get("parts") or []:
+        yield component, None, None, part
+    states = component.get("states") or {}
+    if isinstance(states, dict):
+        for state_name, state_obj in states.items():
+            if not isinstance(state_obj, dict):
+                continue
+            for part in state_obj.get("parts") or []:
+                yield component, state_name, state_obj, part
+    for child in component.get("children") or []:
+        yield from iter_component_parts(child, ancestors + [component])
+
+
+
+def paint_index_map(tree):
+    """Map layer_id -> painter's order (smaller is under).
+
+    psd-tools / our collect_layer store children bottom-to-top, which matches
+    Photoshop compositing. Walk pre-order so a group is indexed among its
+    siblings, then its descendants (who would sit above a group background).
+    """
+    acc = {}
+
+    def walk(node):
+        if not node:
+            return
+        lid = node.get("layer_id")
+        if lid is not None and lid not in acc:
+            acc[int(lid)] = len(acc)
+        for child in node.get("children") or []:
+            walk(child)
+
+    if isinstance(tree, dict) and (tree.get("layer_id") is not None or tree.get("children")):
+        walk(tree)
+    elif isinstance(tree, list):
+        for node in tree:
+            walk(node)
+    return acc
+
+
+def layer_tree_from_manifest(manifest):
+    return manifest.get("layer_tree") or manifest.get("source_tree") or manifest.get("tree")
+
+
+def sort_by_paint_order(items, tree, id_of=lambda x: x.get("layer_id")):
+    if not tree:
+        return list(items)
+    index = paint_index_map(tree)
+    if not index:
+        return list(items)
+
+    def key(item):
+        lid = id_of(item)
+        try:
+            lid = int(lid) if lid is not None else None
+        except (TypeError, ValueError):
+            lid = None
+        if lid in index:
+            return (0, index[lid])
+        # Fall back to the first select_id that is in the tree.
+        for sid in item.get("select_ids") or []:
+            try:
+                sid = int(sid)
+            except (TypeError, ValueError):
+                continue
+            if sid in index:
+                return (0, index[sid])
+        return (1, 0)
+
+    return sorted(items, key=key)
+
+
+def flatten_components(manifest):
+    """Build a flat export entry list from the component tree. Existing entries are replaced."""
+    used = set()
+    entries = []
+    components = manifest.get("components") or []
+
+    def walk_assign(comp):
+        pass
+
+    for component in components:
+        for comp, state_name, state_obj, part in iter_component_parts(component):
+            name = part.get("name") or unique_name(["slice", f"l{part.get('layer_id') or 0}"], used)
+            if name in used:
+                name = unique_name([name], used)
+            else:
+                used.add(name)
+            if part.get("hidden") is not None:
+                hidden = bool(part.get("hidden"))
+            elif state_obj is not None and state_obj.get("from_hidden"):
+                hidden = True
+            else:
+                hidden = bool(part.get("from_hidden"))
+            is_default_state = (state_name is None) or (comp.get("default_state") in {None, state_name})
+            entry = {
+                "name": name,
+                "layer_id": part.get("layer_id"),
+                "select_ids": list(part.get("select_ids") or ([part["layer_id"]] if part.get("layer_id") is not None else [])),
+                "source_name": part.get("source_name") or "",
+                "source_path": part.get("source_path") or "",
+                "kind": part.get("kind") or "image",
+                "logical_bounds": part.get("logical_bounds"),
+                "nine_slice": part.get("nine_slice"),
+                "text": part.get("text"),
+                "parent": comp.get("id") or comp.get("name"),
+                "opacity": part.get("opacity"),
+                "blend_mode": part.get("blend_mode"),
+                "notes": list(part.get("notes") or []),
+                "component_id": comp.get("id"),
+                "component_type": comp.get("type"),
+                "part_role": part.get("role"),
+                "state": state_name,
+                "default_state": comp.get("default_state"),
+                "hidden": hidden,
+                "from_hidden": hidden,
+                "default": bool(is_default_state and not hidden),
+            }
+            if hidden and not entry["default"]:
+                entry["notes"] = list(entry["notes"]) + ["reveal hidden layer for export, then restore"]
+            entries.append(entry)
+    entries = sort_by_paint_order(entries, layer_tree_from_manifest(manifest))
+    manifest["entries"] = entries
+    return entries
+
+
+def cmd_flatten(args):
+    path = Path(args.manifest)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not manifest.get("components"):
+        raise SystemExit("manifest has no components; the agent must write the component tree first")
+    entries = flatten_components(manifest)
+    out = Path(args.out) if args.out else path
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"manifest": str(out), "entry_count": len(entries), "by_kind": dict(Counter(e["kind"] for e in entries)), "hidden_entries": sum(1 for e in entries if e.get("hidden"))}, ensure_ascii=False, indent=2))
+    return 0
+
+
+
+
 def cmd_infer(args):
     if PSDImage is None:
         raise SystemExit("psd-tools is required for infer (pip install psd-tools)")
@@ -1089,21 +1595,27 @@ def cmd_infer(args):
                 "infer_sec": round(time.time() - time_base, 2),
             },
         }
-        manifest_path = dest / "manifest.json"
+        manifest["status"] = "draft_for_agent_review"
+        manifest["review_gate"] = (
+            "This is a keyword-based DRAFT only. The agent must read the prepare materials "
+            "(full render, crops, tree) and write manifest.json with components, parts, and states."
+        )
+        manifest_path = dest / "draft_manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        preview_path = dest / "preview_annotated.png"
+        preview_path = dest / "draft_preview_annotated.png"
         annotate_preview(
             preview_base,
             manifest["entries"],
             (bbox[0], bbox[1]),
             preview_path,
-            f"{target.get('name')}  {len(entries)} slices  (review preview, FX may be missing)",
+            f"{target.get('name')}  {len(entries)} DRAFT slices  (agent must review)",
         )
         return {
-            "manifest": str(manifest_path),
-            "preview": str(preview_path),
+            "draft_manifest": str(manifest_path),
+            "draft_preview": str(preview_path),
             "stats": manifest["stats"],
             "artboard": manifest["source"]["artboard"],
+            "note": "draft only; write manifest.json from prepare materials",
         }
 
     slug_used = set()
@@ -1129,19 +1641,24 @@ def cmd_infer(args):
 
 def cmd_preview(args):
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    if manifest.get("components") and not manifest.get("entries"):
+        flatten_components(manifest)
+    if not manifest.get("entries"):
+        raise SystemExit("manifest has no entries; write components and run flatten first")
     src = manifest["source"]["artboard"]
     ox, oy = src["bounds"][0], src["bounds"][1]
     if args.ref:
         base = Image.open(args.ref).convert("RGBA")
-        # If the ref is the artboard render (no legend), use as-is.
     else:
         w, h = src["size"]
         base = Image.new("RGBA", (w, h), (24, 24, 24, 255))
     out = Path(args.out)
-    # logical_bounds are in document space. Artboard-cropped images need the origin subtracted.
     origin = (0, 0) if args.ref_is_document else (ox, oy)
-    annotate_preview(base, manifest["entries"], origin, out,
-                     f"{src.get('name')}  {len(manifest['entries'])} slices")
+    hidden_n = sum(1 for e in manifest["entries"] if e.get("hidden"))
+    title = f"{src.get('name')}  {len(manifest['entries'])} slices"
+    if hidden_n:
+        title += f"  ({hidden_n} hidden-state)"
+    annotate_preview(base, manifest["entries"], origin, out, title)
     print(f"wrote {out}")
     return 0
 
@@ -1184,6 +1701,43 @@ def extract_bounds_from_export_item(item):
     vis = item.get("visible_bounds") or item.get("bounds_with_effects") or item.get("bounds")
     logi = item.get("logical_bounds") or item.get("bounds_no_effects") or item.get("boundsNoEffects")
     return _rect_to_dict(vis), _rect_to_dict(logi)
+
+
+
+def enrich_components(components, nodes_by_name):
+    """Copy the agent component tree and attach export image / bounds to each part."""
+
+    def enrich_part(part):
+        out = dict(part)
+        node = nodes_by_name.get(part.get("name"))
+        if node:
+            out["image"] = node.get("image")
+            out["visible_bounds"] = node.get("visible_bounds")
+            out["logical_bounds"] = node.get("logical_bounds")
+            out["nine_slice"] = node.get("nine_slice")
+            out["kind"] = node.get("kind") or out.get("kind")
+            if node.get("text"):
+                out["text"] = node["text"]
+        return out
+
+    def enrich(comp):
+        out = {k: v for k, v in comp.items() if k not in {"parts", "states", "children"}}
+        out["parts"] = [enrich_part(part) for part in (comp.get("parts") or [])]
+        states = comp.get("states") or {}
+        if isinstance(states, dict):
+            out["states"] = {}
+            for name, sobj in states.items():
+                if not isinstance(sobj, dict):
+                    out["states"][name] = sobj
+                    continue
+                st = dict(sobj)
+                st["parts"] = [enrich_part(part) for part in (sobj.get("parts") or [])]
+                out["states"][name] = st
+        out["missing"] = list(comp.get("missing") or [])
+        out["children"] = [enrich(child) for child in (comp.get("children") or [])]
+        return out
+
+    return [enrich(c) for c in components]
 
 
 def cmd_build_layout(args):
@@ -1261,9 +1815,18 @@ def cmd_build_layout(args):
             "text": text,
             "opacity": entry.get("opacity"),
             "blend_mode": entry.get("blend_mode"),
+            "component_id": entry.get("component_id"),
+            "component_type": entry.get("component_type"),
+            "part_role": entry.get("part_role"),
+            "state": entry.get("state"),
+            "default": entry.get("default", True),
+            "hidden": entry.get("hidden", False),
         }
         nodes.append(node)
 
+    nodes = sort_by_paint_order(nodes, layer_tree_from_manifest(manifest))
+    nodes_by_name = {n["name"]: n for n in nodes}
+    components = enrich_components(manifest.get("components") or [], nodes_by_name)
     layout = {
         "schema": SCHEMA_LAYOUT,
         "source": manifest["source"],
@@ -1274,9 +1837,13 @@ def cmd_build_layout(args):
             "log": str(Path(args.export_log)),
         },
         "nodes": nodes,
+        "components": components,
+        "missing": manifest.get("missing") or [],
         "tree": manifest.get("tree") or [],
         "notes": [
             "Coordinates are artboard-relative pixels (1x).",
+            "Hierarchy is component semantics (screen > tab_group > tab > state > part).",
+            "source_name / source_path / layer_id are PSD references only.",
             "visible_bounds include layer effects; logical_bounds do not.",
             "anchor is the center of logical_bounds; pivot is normalized (0.5, 0.5).",
             "Engine importers are out of scope for this schema.",
@@ -1639,6 +2206,122 @@ def write_side_by_side(ref, rec, path, titles):
     return path
 
 
+
+def iter_layout_components(components):
+    for comp in components or []:
+        yield comp
+        yield from iter_layout_components(comp.get("children") or [])
+
+
+def default_nodes(layout):
+    nodes = layout.get("nodes") or []
+    if not any(n.get("state") or n.get("hidden") or n.get("default") is False for n in nodes):
+        return nodes
+    return [n for n in nodes if n.get("default")]
+
+
+def layout_with_nodes(layout, nodes):
+    out = dict(layout)
+    out["nodes"] = nodes
+    return out
+
+
+def component_parent_map(components):
+    parent_of = {}
+
+    def walk(nodes, parent=None):
+        for comp in nodes or []:
+            if parent is not None:
+                parent_of[comp.get("id")] = parent
+            walk(comp.get("children") or [], comp)
+
+    walk(components)
+    return parent_of
+
+
+def sibling_fallback_state(sibling):
+    states = set((sibling.get("states") or {}).keys())
+    for cand in ("normal", "off", "idle", "unselected"):
+        if cand in states:
+            return cand
+    return sibling.get("default_state")
+
+
+def nodes_for_activation(layout, activation):
+    """Pick parts for a set of {component_id: state_name} plus default everything else."""
+    act = activation or {}
+    out = []
+    for node in layout.get("nodes") or []:
+        cid = node.get("component_id")
+        if cid in act:
+            st = node.get("state")
+            if st is None or st == act[cid]:
+                out.append(node)
+        elif node.get("default", True):
+            out.append(node)
+    return out
+
+
+def collect_alternate_activations(layout):
+    """Each interactive component's non-default state, with exclusive sibling switching."""
+    components = layout.get("components") or []
+    parent_of = component_parent_map(components)
+    previews = []
+    for comp in iter_layout_components(components):
+        states = comp.get("states") or {}
+        if not isinstance(states, dict) or not states:
+            continue
+        default = comp.get("default_state")
+        parent = parent_of.get(comp.get("id"))
+        exclusive = bool(
+            parent and (
+                parent.get("exclusive")
+                or parent.get("type") in {"tab_group", "navbar", "nav_bar", "segmented"}
+            )
+        )
+        for state_name in states:
+            if default is not None and state_name == default:
+                continue
+            activation = {comp.get("id"): state_name}
+            if exclusive and state_name in {"selected", "on", "active", "pressed"}:
+                for sib in parent.get("children") or []:
+                    if sib.get("id") == comp.get("id"):
+                        continue
+                    fallback = sibling_fallback_state(sib)
+                    if fallback:
+                        activation[sib.get("id")] = fallback
+            stem = f"{comp.get('id')}_{state_name}"
+            previews.append({
+                "id": stem,
+                "component_id": comp.get("id"),
+                "component_type": comp.get("type"),
+                "state": state_name,
+                "activation": activation,
+                "from_hidden": bool((states.get(state_name) or {}).get("from_hidden")),
+            })
+    return previews
+
+
+def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=None):
+    states_dir = Path(out_dir) / "states"
+    states_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for item in collect_alternate_activations(layout):
+        nodes = nodes_for_activation(layout, item["activation"])
+        canvas, placed = recomposite(
+            layout_with_nodes(layout, nodes), slices_dir, canvas_size, render_text=False
+        )
+        path = states_dir / f"{item['id']}.png"
+        canvas.convert("RGB").save(path)
+        item_out = dict(item)
+        item_out["path"] = str(path)
+        item_out["placed"] = len(placed)
+        written.append(item_out)
+    index = {"count": len(written), "previews": written}
+    (states_dir / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    return written
+
+
 def cmd_validate(args):
     layout = json.loads(Path(args.layout).read_text(encoding="utf-8"))
     slices_dir = Path(args.slices_dir)
@@ -1676,23 +2359,24 @@ def cmd_validate(args):
         issues.append({"type": "empty_images", "names": empty})
 
     fonts_dir = getattr(args, "fonts_dir", None)
-    rec_masked, placed_masked = recomposite(layout, slices_dir, (w, h), render_text=False)
+    default_layout = layout_with_nodes(layout, default_nodes(layout))
+    rec_masked, placed_masked = recomposite(default_layout, slices_dir, (w, h), render_text=False)
     rec_text, placed_text = recomposite(
-        layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir
+        default_layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir
     )
 
     cw, ch = min(full.width, w), min(full.height, h)
     ref = np.asarray(full.convert("RGBA").crop((0, 0, cw, ch)))
     rec_m = np.asarray(rec_masked.convert("RGBA").crop((0, 0, cw, ch)))
     rec_t = np.asarray(rec_text.convert("RGBA").crop((0, 0, cw, ch)))
-    text_mask = text_region_mask(layout, cw, ch)
+    text_mask = text_region_mask(default_layout, cw, ch)
 
     m_text_all = metrics(ref, rec_t, None)
     m_text_masked_regions = metrics(ref, rec_t, text_mask)
     m_masked = metrics(ref, rec_m, text_mask)
     m_no_text_all = metrics(ref, rec_m, None)
-    worst10, _all = per_element_diffs(layout, ref, rec_t, cw, ch)
-    worst10_masked, _ = per_element_diffs(layout, ref, rec_m, cw, ch)
+    worst10, _all = per_element_diffs(default_layout, ref, rec_t, cw, ch)
+    worst10_masked, _ = per_element_diffs(default_layout, ref, rec_m, cw, ch)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1707,6 +2391,8 @@ def cmd_validate(args):
         ("Photoshop full render", "Recomposite, dynamic text omitted", "|diff| x3"),
     )
 
+    state_previews = write_state_previews(layout, slices_dir, (w, h), out_dir, fonts_dir=fonts_dir)
+
     rendered = sum(1 for p in placed_text if p.get("rendered"))
     report = {
         "artboard": art,
@@ -1714,7 +2400,8 @@ def cmd_validate(args):
         "full_render_size": list(full.size),
         "canvas": [w, h],
         "node_count": len(layout["nodes"]),
-        "by_kind": dict(Counter(n["kind"] for n in layout["nodes"])),
+        "default_node_count": len(default_layout["nodes"]),
+        "by_kind": dict(Counter(n["kind"] for n in default_layout["nodes"])),
         "fonts_dir": fonts_dir,
         "dynamic_text_rendered": rendered,
         "diff_text_rendered": m_text_all,
@@ -1723,11 +2410,17 @@ def cmd_validate(args):
         "diff_no_text_unmasked": m_no_text_all,
         "worst_10_elements_text_rendered": worst10,
         "worst_10_elements_text_masked": worst10_masked[:10],
+        "state_previews": [
+            {k: v for k, v in item.items() if k != "activation"} | {"activation": item["activation"]}
+            for item in state_previews
+        ],
         "notes": [
+            "Default-state recomposite only (parts currently shown in the PSD) is compared to the PS render.",
             "diff_text_rendered: slices + Pillow approximation of dynamic_text vs the PS render.",
             "diff_text_masked: slices only; dynamic_text boxes excluded from the metrics.",
             "Pillow cannot emulate Photoshop blend modes, layer effects on type, or hinting; residual error there is expected.",
             "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
+            "Alternate states are written to validate/states/<component>_<state>.png for visual check, not measured against the default render.",
         ],
         "issues": issues,
         "placed": len(placed_text),
@@ -1742,7 +2435,23 @@ def build_parser():
     p = argparse.ArgumentParser(description="Agent Photoshop slicing helper")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("infer", help="Infer slicing manifest + annotated preview from a PSD/PSB")
+    s = sub.add_parser("prepare", help="Write agent materials: render preview, crops, layer tree, nine-slice candidates")
+    s.add_argument("--psd", required=True)
+    s.add_argument("--out-dir", required=True)
+    s.add_argument(
+        "--artboard",
+        default=None,
+        help="Artboard name or layer_id. If omitted, every visible top-level artboard is processed "
+             "(or the whole canvas when the document has none).",
+    )
+    s.set_defaults(func=cmd_prepare)
+
+    s = sub.add_parser("flatten", help="Flatten an agent component manifest into export entries")
+    s.add_argument("--manifest", required=True)
+    s.add_argument("--out", default=None, help="Defaults to overwriting --manifest")
+    s.set_defaults(func=cmd_flatten)
+
+    s = sub.add_parser("infer", help="Optional keyword draft only; writes draft_manifest.json for the agent to review")
     s.add_argument("--psd", required=True)
     s.add_argument("--out-dir", required=True)
     s.add_argument(
@@ -1754,7 +2463,7 @@ def build_parser():
     s.add_argument(
         "--rules",
         default=None,
-        help="Optional naming-rules JSON (see naming_rules.example.json). Generic defaults are used when omitted.",
+        help="Optional project naming-convention JSON. Never a substitute for the agent manifest.",
     )
     s.set_defaults(func=cmd_infer)
 

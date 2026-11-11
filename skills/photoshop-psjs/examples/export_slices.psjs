@@ -2,6 +2,7 @@
 // Agent slicing export for Photoshop 23.5+.
 // Reads a confirmed manifest JSON, exports 1x PNGs by layer_id (effects baked in),
 // records visible / logical bounds and text attributes, and writes a full artboard render.
+// Hidden state layers are temporarily shown for their slice, then restored; the doc is never saved.
 //
 // Point CONFIG_URL at the job config JSON (must already exist). Do not pass CLI arguments
 // (the script will not run). See export_config.example.json.
@@ -178,6 +179,61 @@ function findLayer(container, id) {
   return null;
 }
 
+function collectAncestorChain(container, id, chain) {
+  const layers = container.layers || [];
+  for (const layer of layers) {
+    if (layer.id === id) return true;
+    if (layer.layers && layer.layers.length) {
+      if (collectAncestorChain(layer, id, chain)) {
+        chain.push(layer);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Temporarily show a hidden state layer and any hidden ancestors so rasterization
+// has pixels. Always restore before the next slice / full render. The source is
+// closed without saving when this script opened it.
+function revealHiddenChain(src, ids) {
+  const restored = [];
+  const seen = new Set();
+  for (const id of ids) {
+    if (id == null) continue;
+    const layer = findLayer(src, id);
+    const chain = [];
+    collectAncestorChain(src, id, chain);
+    const all = [];
+    if (layer) all.push(layer);
+    for (const ancestor of chain) all.push(ancestor);
+    for (const lyr of all) {
+      if (!lyr || seen.has(lyr.id)) continue;
+      seen.add(lyr.id);
+      try {
+        if (lyr.visible === false) {
+          restored.push({ id: lyr.id, name: lyr.name || "", wasVisible: false });
+          lyr.visible = true;
+        }
+      } catch (err) {
+        restored.push({ id: lyr.id, name: (lyr && lyr.name) || "", error: String(err) });
+      }
+    }
+  }
+  return restored;
+}
+
+function restoreHiddenChain(src, restored) {
+  if (!restored || !restored.length) return;
+  for (let i = restored.length - 1; i >= 0; i--) {
+    const rec = restored[i];
+    if (rec.wasVisible !== false) continue;
+    const lyr = findLayer(src, rec.id);
+    if (!lyr) continue;
+    try { lyr.visible = false; } catch (err) {}
+  }
+}
+
 async function flush() {
   const file = await rootDir.createFile(LOG_NAME, { overwrite: true });
   await file.write(JSON.stringify(log, null, 2));
@@ -291,12 +347,17 @@ try {
           ok: false
         };
         const t1 = nowMs();
+        let revealed = [];
         try {
           app.activeDocument = src;
           if (!ours.has(src.id)) throw new Error("GUARD: lost source doc");
           const selectIds = (entry.select_ids && entry.select_ids.length)
             ? entry.select_ids
             : [entry.layer_id];
+          if (entry.hidden || entry.from_hidden) {
+            revealed = revealHiddenChain(src, selectIds);
+            item.revealed = revealed.map((r) => r.id);
+          }
           const info = await bp([{ _obj: "get", _target: [{ _ref: "layer", _id: entry.layer_id }] }]);
           const desc = info[0] || {};
           if (!log.bound_keys_sample) {
@@ -415,6 +476,15 @@ try {
             }
           } catch (err2) {}
           try { app.activeDocument = src; } catch (err3) {}
+        }
+        try {
+          if (revealed && revealed.length) {
+            app.activeDocument = src;
+            restoreHiddenChain(src, revealed);
+          }
+        } catch (errRestore) {
+          item.restore_error = String(errRestore);
+          log.errs.push({ restore: entry.name, error: String(errRestore) });
         }
         item.ms = nowMs() - t1;
         log.items.push(item);
