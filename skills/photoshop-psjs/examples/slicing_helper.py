@@ -2302,6 +2302,38 @@ def collect_alternate_activations(layout):
     return previews
 
 
+
+def missing_labels_for_state(layout, component_id, state_name):
+    labels = []
+    for comp in iter_layout_components(layout.get("components") or []):
+        if comp.get("id") != component_id:
+            continue
+        for item in comp.get("missing") or []:
+            if isinstance(item, str) and item == state_name:
+                labels.append(f"missing: {state_name}")
+            elif isinstance(item, dict) and item.get("state") == state_name:
+                role = item.get("role")
+                labels.append(f"missing: {role}" if role else f"missing: {state_name}")
+        break
+    return labels
+
+
+def annotate_missing_state(image, labels):
+    """Mark a state preview when a part or state is listed as missing."""
+    draw = ImageDraw.Draw(image)
+    font = load_font(28)
+    text = "  |  ".join(labels)
+    try:
+        tw = draw.textlength(text, font=font)
+    except Exception:
+        tw = 12 * len(text)
+    pad = 10
+    box = [pad, pad, pad + int(tw) + 16, pad + 36]
+    draw.rectangle(box, fill=(20, 20, 20))
+    draw.text((pad + 8, pad + 4), text, fill=(255, 210, 80), font=font)
+    return image
+
+
 def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=None):
     states_dir = Path(out_dir) / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
@@ -2311,11 +2343,16 @@ def write_state_previews(layout, slices_dir, canvas_size, out_dir, fonts_dir=Non
         canvas, placed = recomposite(
             layout_with_nodes(layout, nodes), slices_dir, canvas_size, render_text=False
         )
+        missing_labels = missing_labels_for_state(layout, item.get("component_id"), item.get("state"))
+        rgb = canvas.convert("RGB")
+        if missing_labels:
+            annotate_missing_state(rgb, missing_labels)
         path = states_dir / f"{item['id']}.png"
-        canvas.convert("RGB").save(path)
+        rgb.save(path)
         item_out = dict(item)
         item_out["path"] = str(path)
         item_out["placed"] = len(placed)
+        item_out["missing"] = missing_labels
         written.append(item_out)
     index = {"count": len(written), "previews": written}
     (states_dir / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
