@@ -4,7 +4,7 @@
 
 `bp()` 应：1) 确认 `app.activeDocument.id` 属于本脚本；2) 检查返回数组里是否有 `{_obj:"error"}`。
 
-官方推荐把 `dialogOptions` 写在每条描述符的 `_options` 上。实测里也曾把 `{ dialogOptions: "dontDisplay" }` 作为 `batchPlay` 的**第二个参数**传入且未弹窗；该写法**不在**官方 options 表（`synchronousExecution`、`continueOnError`、`immediateRedraw`）里，新代码优先用描述符 `_options`。
+官方推荐把 `dialogOptions` 写在每条描述符的 `_options` 上。**agent 跑批处理一律用 `"silent"`**，不要用 `"dontDisplay"`：后者在命令失败时仍会弹出阻塞错误框，点确定后只得到 `{_obj:"error", message:"", result:-128}`；`"silent"` 不弹窗，返回带消息的 `{_obj:"error", result:-25920}`。实测里也曾把 `{ dialogOptions: "dontDisplay" }` 作为 `batchPlay` 的**第二个参数**传入且未报错，但该写法**不在**官方 options 表（`synchronousExecution`、`continueOnError`、`immediateRedraw`）里，也无法安全验证它是否生效。新代码把 `dialogOptions` 写在描述符 `_options` 里。
 
 ## 单位与颜色
 
@@ -44,7 +44,7 @@ const mode = (m) => ({ _enum: "blendMode", _value: m });
       topLeft: px(tl), topRight: px(tr), bottomRight: px(br), bottomLeft: px(bl)
     }
   },
-  _options: { dialogOptions: "dontDisplay" }
+  _options: { dialogOptions: "silent" }
 }
 ```
 
@@ -76,7 +76,7 @@ const mode = (m) => ({ _enum: "blendMode", _value: m });
       }]
     }]
   },
-  _options: { dialogOptions: "dontDisplay" }
+  _options: { dialogOptions: "silent" }
 }
 { _obj: "make", _target: [{ _ref: "contentLayer" }], using: { _obj: "contentLayer", type: { /* fill */ } } }
 { _obj: "delete", _target: [{ _ref: "path", _property: "workPath" }] }
@@ -120,7 +120,7 @@ const type = {
 };
 ```
 
-色标 `location` 范围是 0–4096。
+色标 `location` 范围是 0–4096。`interfaceIconFrameDimmed` 为 0 和 4096 时出图不同（实测黑白线性渐变：0 接近线性，4096 是 S 曲线，256×64 图约 98% 像素有差异，单通道最大差 12）。默认用 4096，除非要对齐某个特定观感。
 
 ## 图层样式：描边 / 内阴影 / 投影
 
@@ -164,7 +164,7 @@ const type = {
       noise: pct(0), antiAlias: true, layerConceals: true
     }
   },
-  _options: { dialogOptions: "dontDisplay" }
+  _options: { dialogOptions: "silent" }
 }
 ```
 
@@ -194,4 +194,6 @@ const type = {
 { _obj: "get", _target: [{ _ref: "layer", _id: layerId }] }
 ```
 
-开发期可看全部属性；正式脚本应只取需要的字段，或用官方 `multiGet`。
+开发期可看全部属性；正式脚本应只取需要的字段，或用官方 `multiGet`。读历史状态请用 DOM（`doc.historyStates`），不要 `get` `historyStatesCount`（该命令不可用）。
+
+对非活动文档：`set` 图层属性会失败（命令“设置”当前不可用）；先把该文档设为 `app.activeDocument`。`make` 图层加上 `{ _ref: "document", _id }` 则可以在非活动文档上建图层，且不会切换当前文档。

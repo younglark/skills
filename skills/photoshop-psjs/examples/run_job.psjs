@@ -1,6 +1,7 @@
 // run_job.psjs
 // Agent-driven UXP script skeleton for Photoshop 23.5+.
 // Top-level await is required. Configure paths in this file (CLI args are not reliable).
+// Use dialogOptions "silent" on every descriptor; "dontDisplay" still pops error dialogs.
 // Only documents in the target set are edited. This example creates its own doc;
 // to iterate an existing PSD, locate it by path (reuse it if already open) and add its id
 // to `ours` instead, and do not close or overwrite it unless the task says so.
@@ -70,7 +71,7 @@ try {
         _obj: "set",
         _target: [{ _ref: "layer", _id: layer.id }],
         to: { _obj: "layer", name: "hello" },
-        _options: { dialogOptions: "dontDisplay" }
+        _options: { dialogOptions: "silent" }
       }]);
 
       const png = await rootDir.createFile("preview.png", { overwrite: true });

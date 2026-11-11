@@ -45,12 +45,14 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 - 脚本是现代 JS，支持 **顶层 `await`**。官方示例和实测都依赖它；不要写成「定义了 `async main` 却没人 `await main()`」然后立刻退出。
 - 任何会改文档或应用状态的操作，必须包在 `require("photoshop").core.executeAsModal(fn, { commandName })` 里。`commandName` 会显示在进度条上（脚本超过约 2–3 秒会出现进度条，用户可取消）。
 - DOM 不够用时用 `require("photoshop").action.batchPlay(descriptors, options)`。描述符是 actionJSON。官方建议优先 DOM。用「开发者模式」下 Actions 面板的 **Copy As JavaScript**，或 `Plugins > Development > Record Action Commands...` 录描述符，**不要编造键名**。
-- `dialogOptions` 写在**每条描述符**的 `_options` 里，取值 `"silent"`（默认，出错也不弹窗）、`"dontDisplay"`（一般不弹，缺参或出错时可能弹）、`"display"`。
+- `dialogOptions` 写在**每条描述符**的 `_options` 里，取值 `"silent"`（默认，出错也不弹窗）、`"dontDisplay"`（一般不弹，缺参或出错时可能弹）、`"display"`。**实测（PS 2026）：agent 必须用 `"silent"`。** `"dontDisplay"` 在命令失败时仍会弹出阻塞错误框（如 `命令“获取”当前不可用。`），脚本会一直等到有人点确定；点掉后返回 `{_obj:"error", message:"", result:-128}`（-128 是官方的用户取消码）。`"silent"` 不弹窗，约 1–5ms 返回 `{_obj:"error", message:"脚本名: 命令“…”当前不可用。", result:-25920}`。曾把 `{ dialogOptions: "dontDisplay" }` 作为 `batchPlay` 第二个参数传入且未报错，但官方 options 表没有这个键，也无法安全地用 `"display"` 验证它是否生效。新代码把 `dialogOptions` 写在描述符 `_options` 里，取值用 `"silent"`。
 - `batchPlay` 参数非法会 **reject**；目标不存在等运行期失败则 **resolve**，返回 `{_obj:"error", message, result}`。`result === -128` 表示用户取消。务必检查返回数组。
 - 文件系统：脚本无 manifest，权限由 Photoshop 内置。官方脚本章节仍写：可用文件选择器和 `getTemporaryFolder()`。`getEntryWithUrl` / `createSessionToken` 是官方 FileSystemProvider API（见第 4 节实测）。
-- `require("uxp").script` 提供 `executionContext`、`args`、`setResult(result)`。官方 FAQ（首发说明）曾写：**第一版不支持向脚本传参**。不要依赖命令行参数或 `script.args` 把任务配置传进去；把路径和参数写进脚本，或让脚本读旁边的 JSON。`setResult` 对「`Photoshop.exe` 启动后 agent 如何读返回值」**未核实**，用结果文件。
+- `require("uxp").script` 提供 `executionContext`、`args`、`setResult(result)`。官方 FAQ（首发说明）曾写：**第一版不支持向脚本传参**。不要依赖命令行参数或 `script.args` 把任务配置传进去；把路径和参数写进脚本，或让脚本读旁边的 JSON。
+  **实测（Windows / PS 2026，`Photoshop.exe script.psjs`）：** `script.args` 为 `[]`。若在脚本路径后再跟额外 CLI 参数，脚本不会执行（3 分钟内无结果文件），启动器仍立即返回、退出码 0、stdout 无脚本输出。不要传额外 CLI 参数。`setResult` 可调用，返回 `undefined`，不会出现在 `Photoshop.exe` 的退出码或 stdout 里。始终用结果文件。
 - 同一时刻只能跑一个脚本，脚本不能再调另一个脚本。
 - 官方 `executionContext`：`isCancelled` / `onCancel` 用于响应用户取消，`reportProgress({ value, commandName })` 更新进度条，`hostControl.suspendHistory({ documentID, name })` + `resumeHistory(id, commit)` 把一批修改合成一步历史记录，方便美术一次撤销。
+  **实测：** `isCancelled` 是 boolean；`reportProgress` 可调用，返回 `undefined`。`suspendHistory({documentID, name})` 返回 `{historySuspensionID}`，`resumeHistory(id)` 会把随后多次修改合成一步，名称出现在 `doc.historyStates` 里。`hostControl` 的可枚举 key 可能为空，用 `Object.getOwnPropertyNames`。读历史用 DOM（`doc.historyStates` / `doc.activeHistoryState`），不要 batchPlay `get` `historyStatesCount`（该命令不可用，见第 7 节）。
 
 ---
 
@@ -66,7 +68,7 @@ description: "Use when driving Adobe Photoshop with standalone UXP scripts (.psj
 - 若 Photoshop 已打开，脚本在**已有实例**里执行。
 - **启动器立即返回**，脚本在 PS 里异步继续跑。必须轮询脚本自己写的结果 JSON（建议含 `done`、`ok`、`fatal`、`errs`），不要看进程退出码判断成败。
 - 曾测：一个导出脚本把一个 `.psb` 导出为 28 张切片大约 18 秒（其中打开文件约 10 秒），并写 `export_log.json`。
-- **未核实**：仅靠 Windows 文件关联双击 `.psjs` 可能只启动 PS 却不执行脚本。agent 启动请显式传 `Photoshop.exe` + 脚本路径，并始终以结果文件为准。
+- **实测（Windows / PS 2026）：** 文件关联存在（`.psjs=Photoshop.PSJSFileType.200`，ftype 为 `Photoshop.exe "%1"`）。`Start-Process script.psjs` 会实际执行脚本并写结果文件。agent 仍建议显式传 `Photoshop.exe` + 脚本路径，并以结果文件为准。
 - 启动前确认 PS 没有挂着模态对话框（崩溃后的「恢复文档」提示、存储对话框等）。有对话框时脚本不会按预期执行，轮询只会超时；超时后先截图看 PS 界面，不要盲目重跑。
 
 **远程 agent 流程：** 在 agent 侧写好 `.psjs` → 拷到装有 Photoshop 的机器（只用用户授权的目录）→ 用 shell 启动并轮询日志 → 把 PNG/PSD/日志拷回 → 需要时做像素对比。
@@ -102,7 +104,7 @@ open -a "Adobe Photoshop 2026" /path/to/run_job.psjs
 
 同样必须轮询结果文件。
 
-骨架脚本见 [examples/run_job.psjs](examples/run_job.psjs)（顶层 await、`executeAsModal`、文档 id 守卫、结果文件、`try/catch`）。
+骨架脚本见 [examples/run_job.psjs](examples/run_job.psjs)（顶层 await、`executeAsModal`、文档 id 守卫、结果文件、`try/catch`）。**实测：** 按此骨架跑通：写出 `done`/`ok`、导出 `preview.png`、关闭自己建的文档，其它已开文档的 id 集合不变。
 
 ---
 
@@ -132,10 +134,11 @@ await out.write(JSON.stringify(log, null, 2));
 **确定目标集合 `targets`：**
 
 - 新建：`app.createDocument()` 返回的 id 加入 `targets`。
-- 迭代已有 PSD：按任务给的**路径**定位。先在 `app.documents` 里按 `doc.path` 找是否已打开；已打开就直接用这个实例（不要再开第二份），没打开就 `app.open(entry)`。只按名字匹配不可靠（重名、「-恢复的」副本），优先路径，其次任务给的 doc id。
+- 迭代已有 PSD：按任务给的**路径**定位。先在 `app.documents` 里按 `doc.path` 找是否已打开；已打开就直接用这个实例（不要再开第二份），没打开就 `app.open(entry)`。只按名字匹配不可靠（重名、「-恢复的」副本），优先路径，其次任务给的 doc id。**实测：** 按路径能复用同一实例（同一 doc id，不会打开第二份）；未保存编辑后 `doc.saved === false`；`saveAs(..., true)` 另存新版本时原文件的 mtime 和大小不变，文档保持打开且仍指向原路径。Windows 上 `doc.path` 形如 `D:\\work\\file.psd`。恢复出来的文档（如「xxx-恢复的」）可能 `path` 为空、`saved === false`，按路径找不到，要用任务给的 doc id。
 - 临时文档（如「从图层新建」切片）加入 `targets`，用完 `closeWithoutSaving()`。
 
 **守卫：** 所有 `batchPlay`、保存、关闭之前检查 `app.activeDocument.id` 是否在 `targets` 里。这个检查只管「隐式指向当前文档」的描述符；描述符里显式写了 `{ _ref: "document", _id }` 时，那个 id 也要检查。跑前跑后各记一次 `app.documents.map(d => ({ name: d.name, id: d.id, path: d.path }))` 写进日志。
+  **实测：** `make` 图层时带上非活动文档的 `{ _ref: "document", _id }`，会在该文档上建图层，且 `activeDocument` 不变，所以必须检查显式 id。但 `set` 对非活动文档不可用（见第 7 节）；要改属性，先 `app.activeDocument = target` 再 `set`。
 
 **改已有文档时：**
 
@@ -158,6 +161,10 @@ await out.write(JSON.stringify(log, null, 2));
 ---
 
 ## 7. 实测坑
+
+- **`dialogOptions: "dontDisplay"` 失败时仍会弹阻塞错误框。** agent 跑的每条描述符都应写 `_options: { dialogOptions: "silent" }`。轮询超时先看 PS 是否弹了错误框，不要盲目重跑；有对话框时不要接着启动下一个脚本。
+- **读历史用 DOM，不要用 batchPlay `get` `historyStatesCount`。** 后者会报「命令“获取”当前不可用。」`dontDisplay` 时弹窗，`silent` 时返回 `result: -25920`。用 `doc.historyStates` / `doc.activeHistoryState`。
+- **对非活动文档做 `set` 会失败**（「命令“设置”当前不可用。」）。先把目标设为 `app.activeDocument` 再 `set`。同一写法的 `make` 图层却可以作用到非活动文档，而且不会切换当前文档——描述符里的 document `_id` 必须纳入守卫。
 
 - **多层描边**必须用 `frameFXMulti`（单条可用 `frameFX`）。渐变沿形状外扩用 `gradientType: "shapeburst"`。
 - **`innerShadow` 单键会被静默忽略**，应写成 `innerShadowMulti: [{ _obj: "innerShadow", ... }]`。改完用 `get` 读回 `layerEffects`，确认键真的在。
