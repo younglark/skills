@@ -8,7 +8,7 @@
 python slicing_helper.py infer --psd design.psb --out-dir out --artboard 排行榜_总榜
 python slicing_helper.py preview --manifest out/manifest.json --out out/preview_annotated.png [--ref out/full_render.png]
 python slicing_helper.py build-layout --manifest out/manifest.json --export-log out/export_log.json --slices-dir out/slices --out out/layout.json
-python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate
+python slicing_helper.py validate --layout out/layout.json --slices-dir out/slices --full-render out/full_render.png --out-dir out/validate [--fonts-dir path/to/fonts]
 ```
 
 依赖：`psd-tools`、Pillow、numpy。渐变填充的预览/九宫格分析还需要 `scipy`（`pip install scipy` 或 `psd-tools[composite]`）。大 PSD/PSB 打开时把 `ParseLimits.max_objects` 设为 `None`，否则默认 1,000,000 会直接失败（实测）。
@@ -38,7 +38,12 @@ python slicing_helper.py validate --layout out/layout.json --slices-dir out/slic
 | `text` | 初步文本属性（完整属性在 PS 导出时回填） |
 | `parent` | 层级里的容器名 |
 
-`dynamic_text` 与 `art_text` 的启发式：纯数字/分数/倒计时/玩家名 → `dynamic_text`；带明显装饰性描边或渐变的标题（如「Ranking」）→ `art_text`。审核时以 JSON 为准。
+`dynamic_text` 与 `art_text` 按内容语义判断：
+
+- 分数、倒计时、玩家名、以及 **1–2 位**名次数字 → `dynamic_text`。三位及以上数字（如 `"007"`）当作玩家名，也是 `dynamic_text`，不要当成名次。
+- 固定 UI 文案（如 Daily / Total、导航上的 Ranking / Home / Shop）若带描边、渐变、投影、外发光、斜面等较重效果 → `art_text`，由 PS 栅格化，避免拼图缺字。
+- 同一文案角色在 on/off 或页签成对状态里必须同一 `kind`。若组里任一条是 `art_text`，其余一并升为 `art_text`（例如 Daily 与 Total）。导航下的 Ranking 与顶栏标题 Ranking 是不同角色，不必强行相同。
+- 审核时以 JSON 为准。
 
 ---
 
@@ -62,7 +67,8 @@ python slicing_helper.py validate --layout out/layout.json --slices-dir out/slic
 - 对 `image` / `nine_slice` / `art_text`：按 `select_ids` 多选，`make` 新文档，修剪透明边，必要时把 16 位转 8 位，存 1x PNG。效果烘焙进图。重复实例各导一份，不去重。
 - 对 `dynamic_text`：只 `get` 图层，写出 `textKey` 里的内容、`fontPostScriptName`、字号、颜色（绿色字段是 `grain`）、对齐、描边等，**不出图**。
 - 同时导出目标画板的整图 PNG（`full_render.png`）供校验。若「从图层新建文档」仍是整份多画板画布，按 manifest 里的 `artboard.bounds`（文档坐标）裁切，不要裁 `0,0,w,h`（那会切到最左上角的画板）。
-- 逻辑尺寸用 `boundsNoEffects`（已核实）。`bounds` / DOM `layer.bounds` **不一定**等于含效果的可见框（有时是整份画布或有偏移）。可见框以修剪后的 PNG 尺寸为准：若与逻辑尺寸一致，沿用逻辑框；否则用报告的原点加上 PNG 宽高。
+- 逻辑尺寸用 `boundsNoEffects`（已核实）。`bounds` / DOM `layer.bounds` **不一定**等于含效果的可见框（有时是整份画布，或比 trim 后的不透明区域更松）。
+- 可见框必须按 trim 内缩量计算，不要把 trim 前较松的 `layer.bounds` 左上角当成 PNG 原点。从图层新建的临时文档与源画布对齐时：先记下 trim 前的 `layer.bounds`，trim 后 `layer.bounds.left/top` 是被裁掉的左边/上边像素（常为负数，如 `-5,-6`），紧致原点 = `before.left - after.left`、`before.top - after.top`，尺寸用 PNG 宽高。`slicing_helper.py build-layout` 遇到 `visible_bounds_from_trim_insets` 时不要再改回逻辑框。
 - 写 `export_log.json`（含 `done` / `ok` / `fatal` / `errs` / `docs_before` / `docs_after`），启动后轮询这份文件。
 
 然后：
@@ -151,12 +157,14 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 
 `validate` 会：
 
-1. 按 `visible_bounds` 和 z 序把非 `dynamic_text` 的 PNG 拼回画板大小的画布（普通 alpha 叠放，不模拟 PS 混合模式）。
-2. 与 PS 整图做对比：通道 MAE、PSNR、像素差占比（最大通道差 >16 / >48），以及 CIEDE2000 的 mean / p95 / 占比（ΔE>2、ΔE>5）。同时给出遮罩动态文字区域后的同一组数字。
-3. 检查漏切（manifest 有条目但没有 PNG）、重名、空图（尺寸为 0 或 alpha 全 0）。`dynamic_text` 检查是否写出了文本属性。
-4. 写出 `recomposite.png`、`validate_side_by_side.jpg`、`validate_report.json`。
+1. 按 `visible_bounds` 和 z 序把非 `dynamic_text` 的 PNG 用 **src-over**（`Image.alpha_composite`，不是 `paste+mask`）拼回画板大小的画布。不模拟 PS 混合模式。
+2. 另外用 Pillow 按导出的文本属性把 `dynamic_text` 画进拼图（`--fonts-dir` 有对应 TTF/OTF 时用原字体）。`click_point` 是相对整份文档的百分比，需换算到画板坐标；字号已含 `transform.yy`。Pillow 不能复现 PS 的 hinting、外描边位置和图层样式，文字区仍会有残差。
+3. 与 PS 整图对比，**同时报告两组数字**：`diff_text_rendered`（拼图含 Pillow 文字）和 `diff_text_masked`（不画动态文字，并遮罩其框）。指标：通道 MAE、PSNR、像素差占比（最大通道差 >16 / >48），CIEDE2000 的 mean / p95 / 占比（ΔE>2、ΔE>5）。
+4. 按每条切图的可见框计算误差，报告 mean ΔE 最差的 10 条（文字渲染版与遮罩版各一份）。
+5. 检查漏切（manifest 有条目但没有 PNG）、重名、空图（尺寸为 0 或 alpha 全 0）。`dynamic_text` 检查是否写出了文本属性。
+6. 写出 `recomposite.png`（含文字）、`recomposite_text_masked.png`、`validate_side_by_side.jpg`、`validate_side_by_side_masked.jpg`、`validate_report.json`。
 
-动态文字本来就不会出现在拼图里，所以「全图 ΔE」会包含文字空洞；对照时以遮罩后的数字为主。页签、底栏等重叠层按普通叠放也会和 PS 的混合结果有差，这是预期限制，不是漏切。
+页签、底栏等重叠层按普通 src-over 叠放也会和 PS 的混合结果有差，这是预期限制，不是漏切。
 
 ---
 
@@ -164,22 +172,48 @@ manifest schema 为 `psjs-slice-manifest/v1`，字段见第 1 节，另含 `stat
 
 对象：`排行榜.psb` 的副本（未改、未保存、未关闭用户可能打开的原文档或「排行榜-恢复的.psb」）。目标画板「排行榜_总榜」（`layer_id` 5771，1080×2340）。时间均为 Asia/Shanghai（UTC+8）。
 
+### 8.1 第一轮（修前）
+
 | 步骤 | 结果 |
 |------|------|
 | 推断 | 65 条；约 82.9 秒（打开 2.4 s，条目合成 64.6 s，画板合成 15.8 s）。初步类型：image 23、nine_slice 16、dynamic_text 24、art_text 2。用导出 PNG 重测九宫格后：image 18、nine_slice 21、dynamic_text 24、art_text 2。 |
-| 预览 | 已写出标注预览（框、规范名、九宫格线）。测试中将自动清单视为已确认，未等人工改 JSON。 |
-| 导出 | 65/65 成功（41 张 PNG + 24 条仅属性的动态文字），另写出 1080×2340 整图。墙钟约 43.1 秒（15:36:48–15:37:31），条目耗时合计 33.3 秒（均 512 ms），整图 6.1 秒。脚本打开副本（doc id 59）后不保存关闭；`docs_before` / `docs_after` 均为空。 |
-| 校验 | 漏切 / 重名 / 空图：0。全图：MAE 10.225，PSNR 17.65 dB，>16 的像素 14.117%，>48 的 8.308%，mean ΔE 4.082，p95 ΔE 34.063，ΔE>2 占 19.257%，ΔE>5 占 12.376%。遮罩动态文字后：MAE 6.277，PSNR 20.54 dB，>16 占 10.893%，>48 占 4.901%，mean ΔE 2.599，p95 ΔE 13.569，ΔE>2 占 16.423%，ΔE>5 占 9.01%。约 2.5 秒。 |
+| 预览 | 已写出标注预览。测试中将自动清单视为已确认。 |
+| 导出 | 65/65 成功（41 张 PNG + 24 条仅属性的动态文字），另写出 1080×2340 整图。墙钟约 43.1 秒（15:36:48–15:37:31）。脚本打开副本（doc id 59）后不保存关闭；`docs_before` / `docs_after` 均为空。 |
+| 校验 | 漏切 / 重名 / 空图：0。全图：MAE 10.225，PSNR 17.65 dB，mean ΔE 4.082。遮罩动态文字后：MAE 6.277，PSNR 20.54 dB，mean ΔE 2.599，p95 ΔE 13.569，ΔE>2 占 16.423%，ΔE>5 占 9.01%。 |
+
+当时的问题：Daily 为 `art_text`、Total 为 `dynamic_text`，拼图缺 Total；「007」被当成名次（助手随后改为仅 1–2 位数字是名次，本轮清单未重跑）；几乎每条切图周围有一圈描边状残差。
+
+描边残差的根因（已用逐条 best-fit 和一次 PS probe 核实，不是色管、JPEG 或预乘）：「从图层新建」得到的临时文档与源画布对齐，DOM `layer.bounds` 比 trim 后的不透明区域更松。第一轮把这个较松框的左上角当成 PNG 原点，没有加上被 trim 掉的左边/上边像素。trim 后 `layer.bounds.left/top` 是内缩量（常为负数，如奖牌 `-5,-6`）。紧致原点 = `before.left - after.left`。不透明像素（A≥250）在正确原点上与 PS 整图完全重合（mae=0）。偏移不是全局 +2,+2：头像约 (0,+2)，奖牌约 (+5,+6) 或 (+3,+4)，卡片/美术字约 (+2,+2)。
+
+### 8.2 第二轮（修后重跑，同副本）
+
+| 步骤 | 结果 |
+|------|------|
+| 推断 | 65 条；约 21.9 秒（15:54:32–15:54:54；打开 2.5 s，条目 1.7 s，画板合成 17.7 s）。类型：image 23、nine_slice 16、dynamic_text 22、art_text 4。用导出 PNG 重测九宫格后：image 18、nine_slice 21、dynamic_text 22、art_text 4。 |
+| 预览 | 已重写标注预览。测试中将自动清单视为已确认。 |
+| 分类 | Daily 与 Total 均为 `art_text`（页签成对一致）。顶栏 Ranking 与底栏 Ranking 都是带效果的固定文案，各自为 `art_text`（角色不同，不必成对）。「007」为 `dynamic_text`（玩家名，不是名次）。分数、倒计时、名字、1–2 位名次均为 `dynamic_text`。 |
+| 导出 | 65/65 成功（43 张 PNG + 22 条仅属性的动态文字；新增 Total 与底栏 Ranking 的美术字）。墙钟约 42.1 秒（15:55:34–15:56:16），整图 5.3 秒。43 条光栅切图都记下了 `visible_bounds_from_trim_insets`（如金牌原点 1205,579 = 1200-(-5), 573-(-6)）。脚本打开副本后不保存关闭；`docs_before` / `docs_after` 均为空。日志里 `full_render.out_size` 仍可能是整布 9340×4036（crop 后 `doc.width` 不变），但 `saveAs.png` 写出的文件是当前画板 1080×2340。 |
+| 校验 | 漏切 / 重名 / 空图：0。约 10.4 秒（15:57:17–15:57:27）。用 Exo-Black / Exo-ExtraBold 渲染了全部 22 条动态文字。 |
+
+校验数字对比（同画板、同副本）：
+
+| 指标 | 修前（遮罩动态文字） | 修后（遮罩动态文字） | 修后（Pillow 文字，全图） | 修后（Pillow 文字，排除文字框） |
+|------|----------------------|----------------------|---------------------------|----------------------------------|
+| MAE | 6.277 | **0.076** | 2.440 | 0.125 |
+| PSNR | 20.54 dB | **46.24 dB** | 23.39 dB | 39.01 dB |
+| mean ΔE | 2.599 | **0.047** | 1.041 | 0.067 |
+| p95 ΔE | 13.569 | 0.153 | 0.429 | 0.166 |
+| ΔE>2 | 16.423% | 0.295% | 2.786% | 0.338% |
+| ΔE>5 | 9.01% | 0.157% | 2.547% | 0.199% |
+| 像素差>16 | 10.893% | 0.147% | 2.527% | 0.190% |
+
+Pillow 文字版 mean ΔE 最差的 10 条全部是 `dynamic_text`（分数、名字、名次），来自 Pillow 无法复现 PS 的 hinting、字框锚点和外描边，不是切图错位。遮罩后残留的 >16 差像素共 3429 个（约占遮罩后像素的 0.15%），几乎都叠在底栏：`common_bg_navbar`、`common_btn_navtab_*`、末行列表底板、`common_icon_rank`。这是普通 src-over 不模拟 PS 混合模式造成的，属预期残差，不是漏切或原点错误。
 
 **一并核实的 API / 行为：**
 
 - `boundsNoEffects` 确是不含效果的逻辑框。同次 `get` 还可能出现 `bounds`、`boundsNoMask`，部分层有 `pathBounds` 或 `boundingBox`。不要把 `bounds` 直接当成「含效果可见框」。
-- 对多画板文档做「从图层新建」时，新文档可能仍是整份画布；`saveAs.png` 有时会按当前画板写出 1080×2340 的文件，但 `doc.width` 仍是整布尺寸。模板改为按 `artboard.bounds` 裁切后再记尺寸。
-- 16 位文档导出前需转 8 位。
+- DOM `layer.bounds` 在「从图层新建」的栅格副本上往往比 trim 更松；trim 后 left/top 是内缩量，可见原点用 `before - after`。
+- 对多画板文档做「从图层新建」时，新文档可能仍是整份画布；`saveAs.png` 有时会按当前画板写出 1080×2340 的文件，但 `doc.width` 仍是整布尺寸。模板会尝试按 `artboard.bounds` 裁切；校验以实际 PNG 尺寸为准。
+- 16 位文档导出前需转 8 位（trim 前就转，使内缩量与导出 PNG 一致）。
 - `psd-tools` 1.26 默认 `max_objects=1_000_000`，这份 PSB 会超限；渐变九宫格分析需要 scipy。
-
-**已知限制（这次测试里出现的）：**
-
-- 「007」曾被当成名次（`place`）而不是名字；助手里已改为「1–2 位数字才是名次」，本次清单未重跑。
-- 「Daily」判为 `art_text`（有装饰描边），「Total」判为 `dynamic_text`，拼图里 Total 页签缺字。
-- 剩余像素差主要来自：动态文字不出图、页签/底栏重叠层按普通 alpha 叠放（不模拟 PS 混合）、投影边缘，以及个别列表行（如自己那一行）的填充差异。
+- 校验拼图用 `Image.alpha_composite`（src-over）。`Image.paste(..., mask=)` 不是正确的 Porter-Duff over。

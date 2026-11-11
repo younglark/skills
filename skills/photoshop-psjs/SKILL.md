@@ -222,9 +222,9 @@ await out.write(JSON.stringify(log, null, 2));
 2. **审核门闩**：输出标注预览图（框出每个切图、标规范名和九宫格线）和 manifest JSON。用户改 JSON 确认；`status` 在确认前保持 `pending_review`。
 3. **导出（`.psjs`）**：按 `layer_id`（及可见剪贴层）导出 1x PNG，图层效果烘焙进图；重复实例各导一份，不去重。`dynamic_text` 不出图，只导出文本、字体 PostScript 名、字号、颜色、描边、对齐等属性；`art_text` 出图。
 4. **布局 JSON**：引擎无关的中间格式，记录层级、可见尺寸（含效果）、逻辑尺寸（不含效果）、按逻辑尺寸中心计算的锚点、九宫格边距、文本属性和对应图片。各引擎导入器自己写，不在本 skill 里。
-5. **校验**：按元数据把切图拼回去，和 PS 整图画板对比像素差 / CIEDE2000 ΔE（同时给出遮罩动态文字区域后的数字）；再检查漏切、重名、空图。
+5. **校验**：按元数据把切图用 src-over 拼回去，和 PS 整图画板对比像素差 / CIEDE2000 ΔE；同时报告 Pillow 渲染动态文字后的数字、以及遮罩动态文字区域后的数字，并列出误差最大的 10 条。再检查漏切、重名、空图。
 
 沿用第 2–5 节的规则：每条描述符 `_options.dialogOptions = "silent"`，轮询结果 JSON，文档 id 守卫，不加额外 CLI 参数，顶层 `await`，`executeAsModal`，需要时 `suspendHistory`。
 
-**实测（Windows / PS 2026，排行榜.psb 副本，画板「排行榜_总榜」1080×2340）：** 推断 65 条（最终 image 18 / nine_slice 21 / dynamic_text 24 / art_text 2），约 83 秒（需提高 `psd-tools` 的 `ParseLimits`，渐变合成需 scipy）；审核预览已生成，测试中将自动清单视为已确认；导出 65/65 成功、41 张 PNG，约 43 秒；漏切/重名/空图为 0。和 PS 整图对比：全图 mean ΔE 4.082、p95 ΔE 34.063；遮罩动态文字后 mean ΔE 2.599、p95 ΔE 13.569。剩余差距主要来自动态文字（故意不出图）、页签/底栏重叠层的普通叠放，以及部分投影边缘。
+**实测（Windows / PS 2026，排行榜.psb 副本，画板「排行榜_总榜」1080×2340，Asia/Shanghai）：** 修后重跑推断 65 条（最终 image 18 / nine_slice 21 / dynamic_text 22 / art_text 4；Daily/Total 与带效果的固定文案为 `art_text`，「007」为动态玩家名），约 22 秒（需提高 `psd-tools` 的 `ParseLimits`，渐变合成需 scipy）；审核预览已生成，测试中将自动清单视为已确认；导出 65/65 成功、43 张 PNG，约 42 秒；漏切/重名/空图为 0。可见框按 trim 内缩量对齐后，遮罩动态文字：mean ΔE **0.047**、PSNR **46.24 dB**（修前为 2.599 / 20.54 dB）。用原字体 Pillow 近似动态文字后全图 mean ΔE 1.041、PSNR 23.39 dB，残差几乎都在文字本身（hinting / 描边，非切图错位）。遮罩后约 0.15% 像素差 >16，集中在底栏重叠层，属未模拟 PS 混合模式的预期残差。细节与第一轮对比见 [references/slicing.md](references/slicing.md) 第 8 节。
 

@@ -49,13 +49,16 @@ function val(x) {
 
 function unitRect(r) {
   if (!r || typeof r !== "object") return null;
-  if (!("left" in r) && !("top" in r)) return null;
-  return {
-    left: val(r.left),
-    top: val(r.top),
-    right: val(r.right),
-    bottom: val(r.bottom)
-  };
+  const left = (r.left != null) ? val(r.left) : ((r._left != null) ? r._left : null);
+  const top = (r.top != null) ? val(r.top) : ((r._top != null) ? r._top : null);
+  const right = (r.right != null) ? val(r.right) : ((r._right != null) ? r._right : null);
+  const bottom = (r.bottom != null) ? val(r.bottom) : ((r._bottom != null) ? r._bottom : null);
+  if (left == null || top == null || right == null || bottom == null) return null;
+  return { left: left, top: top, right: right, bottom: bottom };
+}
+
+function packDomBounds(b) {
+  return unitRect(b);
 }
 
 function collectBoundKeys(desc) {
@@ -333,36 +336,46 @@ try {
             await executionContext.hostControl.registerAutoCloseDocument(tmp.id);
           } catch (err) {}
           for (const layer of tmp.layers) layer.visible = true;
+          // Convert to 8-bit before measuring / trimming so near-zero 16-bit
+          // alpha is quantized the same way as the exported PNG.
+          await ensureEightBit(tmp);
+          if (tmp.layers.length > 1) {
+            try { await bp([{ _obj: "mergeVisible" }]); }
+            catch (err) { item.merge_error = String(err); }
+          }
+          item.tmp_before_size = [tmp.width, tmp.height];
+          item.tmp_aligned_with_source = (tmp.width === src.width && tmp.height === src.height);
+          const beforeTrim = packDomBounds(tmp.layers[0] && tmp.layers[0].bounds);
+          item.layer_bounds_before_trim = beforeTrim;
           await bp([{
             _obj: "trim",
             trimBasedOn: { _enum: "trimBasedOn", _value: "transparency" },
             top: true, bottom: true, left: true, right: true
           }]);
-          await ensureEightBit(tmp);
+          const afterTrim = packDomBounds(tmp.layers[0] && tmp.layers[0].bounds);
+          item.layer_bounds_after_trim = afterTrim;
           item.out_size = [tmp.width, tmp.height];
-          // If Photoshop did not give a with-effects rect, reconstruct it from
-          // the trimmed PNG size anchored to the logical top-left (may undershoot shadows).
-          if (item.logical_bounds && item.out_size
+          // Root cause of the outline mismatch: layer.bounds on the raster copy
+          // is looser than trim (it still includes nearly-transparent padding).
+          // After trim, layer.bounds.left/top are the negative insets (e.g. -5,-6).
+          // Tight visible origin in source space = before.left - after.left.
+          // Do NOT use the pre-trim origin as the PNG's top-left.
+          if (item.tmp_aligned_with_source && beforeTrim && afterTrim) {
+            const left = beforeTrim.left - afterTrim.left;
+            const top = beforeTrim.top - afterTrim.top;
+            item.visible_bounds_reported = item.visible_bounds;
+            item.visible_bounds = {
+              left: left,
+              top: top,
+              right: left + tmp.width,
+              bottom: top + tmp.height
+            };
+            item.visible_bounds_from_trim_insets = true;
+          } else if (item.logical_bounds && item.out_size
               && Math.abs((item.logical_bounds.right - item.logical_bounds.left) - tmp.width) <= 1
               && Math.abs((item.logical_bounds.bottom - item.logical_bounds.top) - tmp.height) <= 1) {
-            // Effects did not expand the raster; keep the logical box as visible.
             item.visible_bounds = item.logical_bounds;
             item.visible_bounds_matches_logical = true;
-          } else if (item.visible_bounds && item.out_size) {
-            // Keep the reported origin; size should match the PNG when possible.
-            const vb = item.visible_bounds;
-            const vw = vb.right - vb.left;
-            const vh = vb.bottom - vb.top;
-            if (Math.abs(vw - tmp.width) > 1 || Math.abs(vh - tmp.height) > 1) {
-              item.visible_bounds_reported = vb;
-              item.visible_bounds = {
-                left: vb.left,
-                top: vb.top,
-                right: vb.left + tmp.width,
-                bottom: vb.top + tmp.height
-              };
-              item.visible_bounds_adjusted_to_png = true;
-            }
           } else if (item.logical_bounds) {
             const lb = item.logical_bounds;
             item.visible_bounds = {

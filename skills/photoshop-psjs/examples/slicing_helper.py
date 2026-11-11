@@ -308,22 +308,94 @@ def should_descend(node, art_w, art_h):
     return False
 
 
+def normalize_text(text: str) -> str:
+    return re.sub(r"[\r\n]+", " ", text or "").strip()
+
+
+FIXED_LABEL_TEXTS = {
+    "daily", "total", "home", "ranking", "shop", "rank", "store",
+}
+
+
+def has_heavy_effects(node) -> bool:
+    """Typographic / decorative layer effects that should be baked as art_text."""
+    keys = ("stroke", "frame", "gradient", "shadow", "glow", "bevel")
+    return any(any(k in (e or "").lower() for k in keys) for e in (node.get("effects") or []))
+
+
+def is_fixed_label(text: str) -> bool:
+    return normalize_text(text).casefold() in FIXED_LABEL_TEXTS
+
+
+def is_value_text(text: str) -> bool:
+    """Numbers, names, scores, and timers — rendered by the engine, not baked."""
+    t = normalize_text(text)
+    if not t:
+        return False
+    if is_fixed_label(t):
+        return False
+    if re.search(r"\d+\s*[hH小时].*\d+\s*[mM分]|\d+h\s*\d+m", t):
+        return True
+    if re.search(r"^(score|level|分数)\b", t, re.I) or re.search(r"score\s*\d+", t, re.I):
+        return True
+    # Place numbers are 1-2 digits only. "007" and other zero-padded ids are names.
+    if re.fullmatch(r"\d{1,2}", t):
+        return True
+    if re.fullmatch(r"\d{3,}", t):
+        return True  # 007-style ids
+    if re.search(r"[A-Za-z]+\d+", t) or re.search(r"(myself|player\s*name)", t, re.I):
+        return True
+    if re.search(r"[A-Za-z]", t):
+        return True
+    if re.fullmatch(r"[\d.,\s]+", t):
+        return True
+    return False
+
+
 def classify_text(node) -> str:
-    text = (node.get("text") or "").strip()
+    text = node.get("text") or ""
     name = node.get("name") or ""
-    heavy = bool(set(node.get("effects") or []) & {"Stroke", "GradientOverlay", "FrameFX", "frameFX"})
-    # psd-tools class names vary; also treat any stroke-like effect as heavy.
-    heavy = heavy or any("stroke" in e.lower() or "frame" in e.lower() or "gradient" in e.lower()
-                         for e in (node.get("effects") or []))
     if re.search(r"标题|title|美术字", name, re.I):
         return "art_text"
-    if re.fullmatch(r"[\d.,\s]+", text) or re.search(r"\d+\s*[hHmM秒分点小时]|score|分数", text):
+    if is_value_text(text):
         return "dynamic_text"
-    if re.search(r"[A-Za-z]+\d+", text) or re.search(r"(myself|player|name|id)", text, re.I):
-        return "dynamic_text"
-    if heavy and text and not re.search(r"\d", text):
+    if is_fixed_label(text):
+        # Preliminary; apply_pair_consistency may upgrade partners in an on/off set.
+        return "art_text" if has_heavy_effects(node) else "dynamic_text"
+    if has_heavy_effects(node) and normalize_text(text) and not re.search(r"\d", normalize_text(text)):
         return "art_text"
     return "dynamic_text"
+
+
+def apply_pair_consistency(entries):
+    """The same text role in an on/off or tab pair must share one kind.
+    If any member is art_text, all become art_text so no visible label is dropped.
+    """
+    groups = {}
+    for entry in entries:
+        if entry.get("kind") not in {"dynamic_text", "art_text"}:
+            continue
+        content = normalize_text((entry.get("text") or {}).get("content") or "")
+        if not is_fixed_label(content):
+            continue
+        path = (entry.get("source_path") or "").lower()
+        if "页签" in path or "/tab" in path or "group_tab" in path:
+            role = "tab_label"
+        elif "底部ui" in path or "navbar" in path:
+            role = "nav_label"
+        elif "顶部ui" in path or "topbar" in path:
+            role = "title_label"
+        else:
+            role = "label:" + content.casefold()
+        groups.setdefault(role, []).append(entry)
+    for members in groups.values():
+        if any(m.get("kind") == "art_text" for m in members):
+            for member in members:
+                if member.get("kind") != "art_text":
+                    member["kind"] = "art_text"
+                    member.setdefault("notes", []).append(
+                        "kind raised to art_text to match on/off or tab-label pair"
+                    )
 
 
 def infer_module(path: str, artboard_name: str) -> str:
@@ -671,7 +743,20 @@ def build_entries(artboard, art_w, art_h, module_hint, warnings):
         return emit(node, [], parent_name, z_base, [])
 
     tree = walk(artboard, None)
+    apply_pair_consistency(entries)
+    by_name = {e["name"]: e for e in entries}
+
+    def sync_tree_kinds(node):
+        if not node:
+            return
+        entry = by_name.get(node.get("name"))
+        if entry:
+            node["kind"] = entry["kind"]
+        for child in node.get("children") or []:
+            sync_tree_kinds(child)
+
     if tree:
+        sync_tree_kinds(tree)
         tree_nodes.append(tree)
     return entries, tree_nodes
 
@@ -968,11 +1053,12 @@ def cmd_build_layout(args):
             logi = _rect_to_dict(entry.get("logical_bounds"))
         if vis is None:
             vis = logi
-        # If the PNG is the same size as the logical box, effects did not expand
-        # the pixels (or were clipped). Prefer the logical origin over a stale
-        # `bounds` / DOM box that may be the full canvas or otherwise offset.
+        # Prefer the post-trim inset origin computed in export_slices.psjs.
+        # Only fall back to "PNG size == logical size → use logical origin"
+        # when the exporter did not record trim insets (older logs).
         png_size = item.get("out_size")
-        if logi and png_size and len(png_size) == 2:
+        if (not item.get("visible_bounds_from_trim_insets")
+                and logi and png_size and len(png_size) == 2):
             lw = logi["right"] - logi["left"]
             lh = logi["bottom"] - logi["top"]
             if abs(lw - png_size[0]) <= 1 and abs(lh - png_size[1]) <= 1:
@@ -1112,12 +1198,153 @@ def ciede2000(lab1, lab2):
     return dE
 
 
-def recomposite(layout, slices_dir, canvas_size):
+def alpha_over(canvas: Image.Image, im: Image.Image, xy) -> Image.Image:
+    """True src-over. Image.paste(..., mask=im) is not a correct Porter-Duff over."""
+    if im.mode != "RGBA":
+        im = im.convert("RGBA")
+    x, y = int(xy[0]), int(xy[1])
+    cw, ch = canvas.size
+    iw, ih = im.size
+    sx = 0 if x >= 0 else -x
+    sy = 0 if y >= 0 else -y
+    dx, dy = max(x, 0), max(y, 0)
+    tw, th = min(iw - sx, cw - dx), min(ih - sy, ch - dy)
+    if tw <= 0 or th <= 0:
+        return canvas
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    layer.paste(im.crop((sx, sy, sx + tw, sy + th)), (dx, dy))
+    return Image.alpha_composite(canvas, layer)
+
+
+def hex_to_rgba(s, alpha=255):
+    s = (s or "#ffffff").lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) < 6:
+        return (255, 255, 255, int(alpha))
+    r, g, b = int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    return (r, g, b, int(max(0, min(255, alpha))))
+
+
+def iter_font_files(fonts_dir):
+    if not fonts_dir:
+        return
+    root = Path(fonts_dir)
+    folders = [root]
+    if root.is_dir():
+        parent = root.parent
+        for extra in (parent / "fonts_install", parent / "fonts"):
+            if extra.is_dir() and extra not in folders:
+                folders.append(extra)
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for pat in ("*.ttf", "*.otf", "*.TTC", "*.ttc", "*.TTF", "*.OTF"):
+            yield from sorted(folder.glob(pat))
+
+
+def load_font_named(name, size, fonts_dir=None):
+    size = max(1, int(round(size or 16)))
+    needle = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    ranked = []
+    for path in iter_font_files(fonts_dir):
+        stem = re.sub(r"[^a-z0-9]+", "", path.stem.lower())
+        if needle and (needle == stem or needle in stem or stem in needle):
+            ranked.insert(0, path)
+        else:
+            ranked.append(path)
+    for path in ranked:
+        try:
+            return ImageFont.truetype(str(path), size=size)
+        except Exception:
+            continue
+    return load_font(size)
+
+
+def draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin):
+    """Approximate a dynamic_text node with Pillow. Not a PS typography emulator."""
+    text = node.get("text") or {}
+    content = (text.get("content") or "").replace("\r", "\n")
+    if not content or not str(content).strip():
+        return canvas, {"name": node["name"], "skipped": "empty"}
+    size = text.get("size") or 24
+    font = load_font_named(text.get("font"), size, fonts_dir)
+    opacity = text.get("opacity")
+    alpha = int(round((opacity if opacity is not None else 1) * 255)) if (opacity is None or opacity <= 1) else int(round(opacity / 100.0 * 255))
+    color = hex_to_rgba(text.get("color") or "#ffffff", alpha)
+    stroke = text.get("stroke") or {}
+    stroke_w = 0
+    stroke_fill = None
+    if stroke and stroke.get("enabled") is not False and stroke.get("size"):
+        stroke_w = max(0, int(round(float(stroke.get("size") or 0))))
+        sop = stroke.get("opacity")
+        if sop is None:
+            sa = 255
+        elif sop <= 1:
+            sa = int(round(sop * 255))
+        else:
+            sa = int(round(sop / 100.0 * 255))
+        stroke_fill = hex_to_rgba(stroke.get("color") or "#000000", sa)
+    align = str(text.get("alignment") or "left").lower()
+    if "center" in align:
+        anchor = "ms"
+    elif "right" in align:
+        anchor = "rs"
+    else:
+        anchor = "ls"
+    ox, oy = art_origin
+    dw, dh = doc_size if doc_size and all(doc_size) else (None, None)
+    cp = text.get("click_point") or {}
+    if cp and cp.get("horizontal") is not None and dw:
+        ax = cp["horizontal"] / 100.0 * dw - ox
+        ay = cp["vertical"] / 100.0 * dh - oy
+    else:
+        box = node.get("logical_bounds") or node.get("visible_bounds") or {}
+        ax = (box.get("left", 0) + box.get("right", 0)) / 2.0
+        ay = box.get("bottom", 0)
+        if "center" not in align:
+            ax = box.get("left", ax)
+    lines = content.split("\n")
+    leading = text.get("leading")
+    if leading:
+        line_h = float(leading)
+    else:
+        line_h = float(size) * 1.2
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    for i, line in enumerate(lines):
+        y = ay + i * line_h
+        kwargs = {"font": font, "fill": color, "anchor": anchor}
+        if stroke_w:
+            kwargs["stroke_width"] = stroke_w
+            kwargs["stroke_fill"] = stroke_fill
+        try:
+            draw.text((ax, y), line, **kwargs)
+        except TypeError:
+            draw.text((ax, y), line, font=font, fill=color)
+    return Image.alpha_composite(canvas, layer), {
+        "name": node["name"],
+        "xy": [round(ax, 2), round(ay, 2)],
+        "anchor": anchor,
+        "rendered": True,
+        "font": text.get("font"),
+        "size": size,
+    }
+
+
+def recomposite(layout, slices_dir, canvas_size, render_text=False, fonts_dir=None):
     w, h = canvas_size
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     placed = []
+    src = layout.get("source") or {}
+    art = src.get("artboard") or {}
+    doc_size = src.get("doc_size") or [None, None]
+    art_origin = (art.get("bounds") or [0, 0])[0:2]
     for node in layout["nodes"]:
         if node["kind"] == "dynamic_text":
+            if render_text:
+                canvas, info = draw_dynamic_text(canvas, node, fonts_dir, doc_size, art_origin)
+                placed.append(info)
             continue
         image_name = node.get("image")
         if not image_name:
@@ -1132,9 +1359,119 @@ def recomposite(layout, slices_dir, canvas_size):
             placed.append({"name": node["name"], "missing_bounds": True})
             continue
         x, y = int(round(vb["left"])), int(round(vb["top"]))
-        canvas.paste(im, (x, y), im)
+        canvas = alpha_over(canvas, im, (x, y))
         placed.append({"name": node["name"], "xy": [x, y], "size": list(im.size)})
     return canvas, placed
+
+
+def text_region_mask(layout, cw, ch):
+    mask = np.zeros((ch, cw), dtype=bool)
+    for node in layout["nodes"]:
+        if node["kind"] != "dynamic_text":
+            continue
+        b = node.get("visible_bounds") or node.get("logical_bounds")
+        if not b:
+            continue
+        l, top, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
+        l, top = max(0, l), max(0, top)
+        r, bt = min(cw, r), min(ch, bt)
+        if r > l and bt > top:
+            mask[top:bt, l:r] = True
+    return mask
+
+
+def metrics(a, b, mask=None):
+    rgb_a, rgb_b = a[..., :3], b[..., :3]
+    if mask is not None:
+        keep = ~mask
+        if not keep.any():
+            return {}
+        rgb_a, rgb_b = rgb_a[keep], rgb_b[keep]
+        alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))[keep]
+    else:
+        alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))
+    diff = np.abs(rgb_a.astype(np.int16) - rgb_b.astype(np.int16))
+    chan_max = diff.max(axis=-1)
+    mae = float(diff.mean())
+    mse = float((diff.astype(np.float64) ** 2).mean())
+    psnr = 10 * np.log10(255 ** 2 / mse) if mse else 99.0
+    lab_a = rgb_to_lab(rgb_a.reshape(-1, 3) if mask is not None else rgb_a)
+    lab_b = rgb_to_lab(rgb_b.reshape(-1, 3) if mask is not None else rgb_b)
+    dE = ciede2000(lab_a, lab_b)
+    return {
+        "mae": round(mae, 3),
+        "psnr_db": round(float(psnr), 2),
+        "pct_px_diff_gt16": round(float((chan_max > 16).mean() * 100), 3),
+        "pct_px_diff_gt48": round(float((chan_max > 48).mean() * 100), 3),
+        "mean_delta_e": round(float(dE.mean()), 3),
+        "p95_delta_e": round(float(np.percentile(dE, 95)), 3),
+        "pct_delta_e_gt2": round(float((dE > 2).mean() * 100), 3),
+        "pct_delta_e_gt5": round(float((dE > 5).mean() * 100), 3),
+        "mean_alpha_diff": round(float(alpha_diff.mean()), 3),
+    }
+
+
+def per_element_diffs(layout, ref, rec, cw, ch):
+    rows = []
+    for node in layout["nodes"]:
+        b = node.get("visible_bounds") or node.get("logical_bounds")
+        if not b:
+            continue
+        l, top, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
+        l, top = max(0, l), max(0, top)
+        r, bt = min(cw, r), min(ch, bt)
+        if r <= l or bt <= top:
+            continue
+        aa = ref[top:bt, l:r]
+        bb = rec[top:bt, l:r]
+        diff = np.abs(aa[..., :3].astype(np.int16) - bb[..., :3].astype(np.int16))
+        chan_max = diff.max(axis=-1)
+        mae = float(diff.mean())
+        mse = float((diff.astype(np.float64) ** 2).mean())
+        psnr = 10 * np.log10(255 ** 2 / mse) if mse else 99.0
+        lab_a = rgb_to_lab(aa[..., :3].reshape(-1, 3))
+        lab_b = rgb_to_lab(bb[..., :3].reshape(-1, 3))
+        dE = ciede2000(lab_a, lab_b)
+        rows.append({
+            "name": node["name"],
+            "kind": node["kind"],
+            "bounds": [l, top, r, bt],
+            "mae": round(mae, 3),
+            "psnr_db": round(float(psnr), 2),
+            "mean_delta_e": round(float(dE.mean()), 3),
+            "p95_delta_e": round(float(np.percentile(dE, 95)), 3),
+            "pct_delta_e_gt5": round(float((dE > 5).mean() * 100), 3),
+            "pct_px_diff_gt16": round(float((chan_max > 16).mean() * 100), 3),
+        })
+    rows.sort(key=lambda row: (-row["mean_delta_e"], -row["mae"]))
+    return rows[:10], rows
+
+
+def write_side_by_side(ref, rec, path, titles):
+    ch, cw = ref.shape[0], ref.shape[1]
+    d_rgb = np.abs(ref[..., :3].astype(np.int16) - rec[..., :3].astype(np.int16)).max(axis=2)
+    heat = np.zeros((ch, cw, 3), dtype=np.uint8)
+    v = np.clip(d_rgb * 3, 0, 255).astype(np.uint8)
+    heat[..., 0] = v
+    heat[..., 1] = (v * 0.3).astype(np.uint8)
+    g = (ref[..., :3].mean(axis=2) * 0.25).astype(np.uint8)
+    heat = np.maximum(heat, np.stack([g, g, g], axis=2))
+    scale = 0.5
+    rw, rh = int(cw * scale), int(ch * scale)
+    canvas = Image.new("RGB", (rw * 3 + 40, rh + 50), (30, 30, 30))
+    dr = ImageDraw.Draw(canvas)
+    font = load_font(16)
+    images = [
+        (Image.fromarray(ref[..., :3]), titles[0]),
+        (Image.fromarray(rec[..., :3]), titles[1]),
+        (Image.fromarray(heat), titles[2]),
+    ]
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    for i, (im, title) in enumerate(images):
+        canvas.paste(im.resize((rw, rh), resampling), (i * (rw + 20), 40))
+        dr.text((i * (rw + 20) + 8, 10), title, fill=(255, 255, 255), font=font)
+    canvas.save(path, quality=88)
+    return path
 
 
 def cmd_validate(args):
@@ -1144,7 +1481,6 @@ def cmd_validate(args):
     art = layout["source"]["artboard"]
     w, h = art["size"]
     if full.size != (w, h):
-        # Allow a render that still has a legend or slight mismatch; crop/resize is not done silently.
         print(f"warning: full render size {full.size} != artboard {w}x{h}", flush=True)
 
     issues = []
@@ -1174,87 +1510,39 @@ def cmd_validate(args):
     if empty:
         issues.append({"type": "empty_images", "names": empty})
 
-    recomposed, placed = recomposite(layout, slices_dir, (w, h))
-    # Align sizes for the pixel comparison.
+    fonts_dir = getattr(args, "fonts_dir", None)
+    rec_masked, placed_masked = recomposite(layout, slices_dir, (w, h), render_text=False)
+    rec_text, placed_text = recomposite(
+        layout, slices_dir, (w, h), render_text=True, fonts_dir=fonts_dir
+    )
+
     cw, ch = min(full.width, w), min(full.height, h)
     ref = np.asarray(full.convert("RGBA").crop((0, 0, cw, ch)))
-    rec = np.asarray(recomposed.convert("RGBA").crop((0, 0, cw, ch)))
+    rec_m = np.asarray(rec_masked.convert("RGBA").crop((0, 0, cw, ch)))
+    rec_t = np.asarray(rec_text.convert("RGBA").crop((0, 0, cw, ch)))
+    text_mask = text_region_mask(layout, cw, ch)
 
-    # Mask dynamic text regions so typography the engine will redraw is not counted as a miss.
-    text_mask = np.zeros((ch, cw), dtype=bool)
-    for node in layout["nodes"]:
-        if node["kind"] != "dynamic_text":
-            continue
-        b = node.get("visible_bounds") or node.get("logical_bounds")
-        if not b:
-            continue
-        l, t, r, bt = [int(round(v)) for v in (b["left"], b["top"], b["right"], b["bottom"])]
-        l, t = max(0, l), max(0, t)
-        r, bt = min(cw, r), min(ch, bt)
-        if r > l and bt > t:
-            text_mask[t:bt, l:r] = True
+    m_text_all = metrics(ref, rec_t, None)
+    m_text_masked_regions = metrics(ref, rec_t, text_mask)
+    m_masked = metrics(ref, rec_m, text_mask)
+    m_no_text_all = metrics(ref, rec_m, None)
+    worst10, _all = per_element_diffs(layout, ref, rec_t, cw, ch)
+    worst10_masked, _ = per_element_diffs(layout, ref, rec_m, cw, ch)
 
-    def metrics(a, b, mask=None):
-        rgb_a, rgb_b = a[..., :3], b[..., :3]
-        if mask is not None:
-            keep = ~mask
-            if not keep.any():
-                return {}
-            rgb_a, rgb_b = rgb_a[keep], rgb_b[keep]
-            alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))[keep]
-        else:
-            alpha_diff = np.abs(a[..., 3].astype(np.int16) - b[..., 3].astype(np.int16))
-        diff = np.abs(rgb_a.astype(np.int16) - rgb_b.astype(np.int16))
-        chan_max = diff.max(axis=-1)
-        mae = float(diff.mean())
-        mse = float((diff.astype(np.float64) ** 2).mean())
-        psnr = 10 * np.log10(255 ** 2 / mse) if mse else 99.0
-        lab_a = rgb_to_lab(rgb_a.reshape(-1, 3) if mask is not None else rgb_a)
-        lab_b = rgb_to_lab(rgb_b.reshape(-1, 3) if mask is not None else rgb_b)
-        if mask is None:
-            dE = ciede2000(lab_a, lab_b)
-        else:
-            dE = ciede2000(lab_a, lab_b)
-        return {
-            "mae": round(mae, 3),
-            "psnr_db": round(float(psnr), 2),
-            "pct_px_diff_gt16": round(float((chan_max > 16).mean() * 100), 3),
-            "pct_px_diff_gt48": round(float((chan_max > 48).mean() * 100), 3),
-            "mean_delta_e": round(float(dE.mean()), 3),
-            "p95_delta_e": round(float(np.percentile(dE, 95)), 3),
-            "pct_delta_e_gt2": round(float((dE > 2).mean() * 100), 3),
-            "pct_delta_e_gt5": round(float((dE > 5).mean() * 100), 3),
-            "mean_alpha_diff": round(float(alpha_diff.mean()), 3),
-        }
-
-    m_all = metrics(ref, rec, None)
-    m_masked = metrics(ref, rec, text_mask)
-
-    # Visual: side-by-side + heatmap
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    recomposed.convert("PNG" if False else "RGBA").save(out_dir / "recomposite.png")
-    d_rgb = np.abs(ref[..., :3].astype(np.int16) - rec[..., :3].astype(np.int16)).max(axis=2)
-    heat = np.zeros((ch, cw, 3), dtype=np.uint8)
-    v = np.clip(d_rgb * 3, 0, 255).astype(np.uint8)
-    heat[..., 0] = v
-    heat[..., 1] = (v * 0.3).astype(np.uint8)
-    g = (ref[..., :3].mean(axis=2) * 0.25).astype(np.uint8)
-    heat = np.maximum(heat, np.stack([g, g, g], axis=2))
-    scale = 0.5
-    rw, rh = int(cw * scale), int(ch * scale)
-    canvas = Image.new("RGB", (rw * 3 + 40, rh + 50), (30, 30, 30))
-    dr = ImageDraw.Draw(canvas)
-    font = load_font(16)
-    for i, (im, title) in enumerate([
-        (Image.fromarray(ref[..., :3]), "Photoshop full render"),
-        (Image.fromarray(rec[..., :3]), "Recomposite from slices"),
-        (Image.fromarray(heat), "|diff| x3"),
-    ]):
-        canvas.paste(im.resize((rw, rh), getattr(Image, 'Resampling', Image).LANCZOS), (i * (rw + 20), 40))
-        dr.text((i * (rw + 20) + 8, 10), title, fill=(255, 255, 255), font=font)
-    canvas.save(out_dir / "validate_side_by_side.jpg", quality=88)
+    rec_text.save(out_dir / "recomposite.png")
+    rec_masked.save(out_dir / "recomposite_text_masked.png")
+    write_side_by_side(
+        ref, rec_t, out_dir / "validate_side_by_side.jpg",
+        ("Photoshop full render", "Recomposite + Pillow text", "|diff| x3"),
+    )
+    write_side_by_side(
+        ref, rec_m, out_dir / "validate_side_by_side_masked.jpg",
+        ("Photoshop full render", "Recomposite, dynamic text omitted", "|diff| x3"),
+    )
 
+    rendered = sum(1 for p in placed_text if p.get("rendered"))
     report = {
         "artboard": art,
         "full_render": str(args.full_render),
@@ -1262,10 +1550,22 @@ def cmd_validate(args):
         "canvas": [w, h],
         "node_count": len(layout["nodes"]),
         "by_kind": dict(Counter(n["kind"] for n in layout["nodes"])),
-        "diff_all": m_all,
+        "fonts_dir": fonts_dir,
+        "dynamic_text_rendered": rendered,
+        "diff_text_rendered": m_text_all,
+        "diff_text_rendered_excluding_text_boxes": m_text_masked_regions,
         "diff_text_masked": m_masked,
+        "diff_no_text_unmasked": m_no_text_all,
+        "worst_10_elements_text_rendered": worst10,
+        "worst_10_elements_text_masked": worst10_masked[:10],
+        "notes": [
+            "diff_text_rendered: slices + Pillow approximation of dynamic_text vs the PS render.",
+            "diff_text_masked: slices only; dynamic_text boxes excluded from the metrics.",
+            "Pillow cannot emulate Photoshop blend modes, layer effects on type, or hinting; residual error there is expected.",
+            "visible_bounds use post-trim insets (before.left - after.left) so the PNG origin matches the tight opaque box.",
+        ],
         "issues": issues,
-        "placed": len(placed),
+        "placed": len(placed_text),
         "ok": not issues,
     }
     (out_dir / "validate_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1302,6 +1602,7 @@ def build_parser():
     s.add_argument("--slices-dir", required=True)
     s.add_argument("--full-render", required=True)
     s.add_argument("--out-dir", required=True)
+    s.add_argument("--fonts-dir", default=None, help="Directory of TTF/OTF files used to approximate dynamic_text")
     s.set_defaults(func=cmd_validate)
     return p
 
